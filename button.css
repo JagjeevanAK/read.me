@@ -69,7 +69,6 @@
 
 .button:after {
   transform: scale(0);
-  animation: pulse-out 3s var(--ease-elastic) infinite;
 }
 
 .button:before,
