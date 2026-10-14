@@ -345,7 +345,7 @@ footer {
     background: linear-gradient(135deg, var(--accent), #7c3aed);
     border-radius: 10px;
     box-shadow: 0 4px 14px -4px rgba(124, 58, 237, 0.55);
-    transition: transform 0.4s var(--ease), width 0.4s var(--ease);
+    transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1), width 0.3s cubic-bezier(0.4, 0, 0.2, 1);
     z-index: 1;
     /* Width and transform set by JS */
 }
@@ -535,15 +535,5 @@ footer {
     .tab-btn {
         font-size: 0.85rem;
         padding: 10px 6px;
-    }
-}
-
-@media (prefers-reduced-motion: reduce) {
-    *,
-    *::before,
-    *::after {
-        animation-duration: 0.01ms !important;
-        transition-duration: 0.01ms !important;
-        scroll-behavior: auto !important;
     }
 }
