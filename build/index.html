@@ -369,6 +369,50 @@
         <div class="exp-item">
           <div class="exp-header">
             <div class="exp-title">
+              <h3><a href="https://rasayanischoolofscience.com/" target="_blank">Learning Management System (LMS)</a></h3>
+            </div>
+          </div>
+          <ul class="exp-details">
+            <li>Built a course platform where students access PDF and audio content through an in-app viewer and audio
+              player</li>
+            <li>Streams student files through access-checked routes; files are never exposed as proxied signed URLs</li>
+            <li>Accepts requests only from the in-app viewer and audio player, using browser Fetch Metadata to block
+              direct links and downloads</li>
+            <li>Entity-based access control, database-backed sessions with one active device per student, and
+              structured logging with pino</li>
+          </ul>
+          <div class="tech-stack">
+            <span class="tech-badge">Next.js</span>
+            <span class="tech-badge">TypeScript</span>
+            <span class="tech-badge">MongoDB</span>
+            <span class="tech-badge">Better Auth</span>
+            <span class="tech-badge">Cloudflare R2</span>
+            <span class="tech-badge">pino</span>
+          </div>
+        </div>
+
+        <div class="exp-item">
+          <div class="exp-header">
+            <div class="exp-title">
+              <h3><a href="https://prernasaree.com/" target="_blank">Prerna Saree (E-commerce)</a></h3>
+            </div>
+          </div>
+          <ul class="exp-details">
+            <li>Built a full e-commerce storefront with an admin panel for managing products and store content</li>
+            <li>Implemented dynamic reviews and a related-products system, driven from Postgres</li>
+            <li>Deployed on Cloudflare</li>
+          </ul>
+          <div class="tech-stack">
+            <span class="tech-badge">Next.js</span>
+            <span class="tech-badge">PostgreSQL</span>
+            <span class="tech-badge">NextAuth.js</span>
+            <span class="tech-badge">Cloudflare</span>
+          </div>
+        </div>
+
+        <div class="exp-item">
+          <div class="exp-header">
+            <div class="exp-title">
               <h3><a href="https://www.sscreation.online/" target="_blank">SSCreation</a></h3>
             </div>
           </div>
@@ -773,9 +817,13 @@
       });
       const downloadBtn = document.querySelector('.button-wrapper');
       if (downloadBtn) {
+        // Download only once: later clicks (including closing the button) must not re-download
+        let hasDownloaded = false;
         downloadBtn.addEventListener('click', (e) => {
          // e.preventDefault();
           e.stopPropagation();
+          if (hasDownloaded) return;
+          hasDownloaded = true;
           const link = document.createElement('a');
           link.href = 'Atharv_Sankpal.pdf';
           link.download = 'Atharv_Sankpal.pdf';
