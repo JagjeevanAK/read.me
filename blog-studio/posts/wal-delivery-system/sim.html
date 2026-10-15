@@ -1,0 +1,48 @@
+<div class="toolbar">
+  <button class="btn primary" id="pauseBtn">Pause</button>
+  <span class="sep" aria-hidden="true"></span>
+  <button class="btn" data-open="addGen">Add generator</button>
+  <button class="btn" data-open="addGroup">Add consumer</button>
+  <button class="btn" data-open="addDest">Add destination</button>
+  <button class="btn" id="addProdPod">Add producer pod</button>
+  <button class="btn" id="openCp">Edit control plane</button>
+  <span class="push"></span>
+  <select class="btn" id="scenario" aria-label="Break something">
+    <option value="">Break something…</option>
+    <option value="dest-down">Take search-index down (503s)</option>
+    <option value="dest-reject">Make audit-log reject messages (400s)</option>
+    <option value="dest-flaky">Make email-service flaky</option>
+    <option value="dest-slow">Make search-index slow</option>
+    <option value="broker">Kill one Kafka broker</option>
+    <option value="kafka-out">Kafka outage (all brokers)</option>
+    <option value="processor">Crash the outbox processor</option>
+    <option value="pg">Take Postgres down</option>
+    <option value="cp">Take the control plane down</option>
+    <option value="kill-shared">Kill all shared consumer pods</option>
+    <option value="kill-prod">Kill all producer pods</option>
+  </select>
+  <button class="btn" id="healBtn">Heal everything</button>
+  <button class="btn danger" id="resetBtn">Reset</button>
+</div>
+
+<div class="stats" id="stats"></div>
+
+<div class="workspace">
+  <div>
+    <div class="stage" id="cvwrap">
+      <canvas id="cv" role="img" aria-label="Live diagram of generators, producer service, outbox, Kafka, retry topics, consumers and destinations"></canvas>
+    </div>
+    <div class="legend">
+      <span><i style="background:var(--prod)"></i>intake</span>
+      <span><i style="background:var(--pg)"></i>outbox / processed</span>
+      <span><i style="background:var(--ok)"></i>delivered</span>
+      <span><i style="background:var(--retry)"></i>retry or fallback</span>
+      <span><i style="background:var(--bad)"></i>failed, DLQ, rejected</span>
+    </div>
+    <p class="hint">Retry waits run 10× faster: 10s / 1 min / 5 min play as 1s / 6s / 30s (±30% jitter). Retention is compressed separately: 1 day = 10 seconds.</p>
+  </div>
+  <aside class="panel">
+    <div id="inspector"></div>
+    <div class="log"><h3>Events</h3><ol id="log"></ol></div>
+  </aside>
+</div>

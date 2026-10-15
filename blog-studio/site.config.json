@@ -1,0 +1,12 @@
+{
+  "author": "Atharv Sankpal",
+  "authorRole": "Full-Stack Software Engineer",
+  "authorBio": "Full-stack software engineer in Pune. I write about the systems I build, with simulations you can break.",
+  "homeUrl": "../",
+  "homeLabel": "Atharv Sankpal",
+  "blogTitle": "Writing",
+  "blogDescription": "Notes on systems I've built, each with an interactive simulation you can poke at.",
+  "outputDir": "../blogs",
+  "siteUrl": "",
+  "blogPath": "blogs/"
+}

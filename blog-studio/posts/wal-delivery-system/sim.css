@@ -1,0 +1,29 @@
+/* Component colours for the canvas and legend. The generic names (--surface, --ink, --line) map onto the
+   page theme so the diagram follows light/dark automatically. */
+:root {
+  --surface: var(--card);
+  --surface-2: var(--bg-2);
+  --ink: var(--fg);
+  --line: var(--border-strong);
+  --grid: #ebe6dc;
+  --shadow: rgba(76, 29, 149, 0.09);
+  --prod: #0d9488;
+  --kafka: #4f46e5;
+  --cons: #ca8a04;
+  --dest: #c026d3;
+  --cp: #64748b;
+  --pg: #2563eb;
+  --retry: #ea580c;
+}
+:root[data-theme="dark"] {
+  --grid: #1f2737;
+  --shadow: rgba(0, 0, 0, 0.45);
+  --prod: #2dd4bf;
+  --kafka: #818cf8;
+  --cons: #facc15;
+  --dest: #e879f9;
+  --cp: #94a3b8;
+  --pg: #60a5fa;
+  --retry: #fb923c;
+}
+#cv { cursor: default; }

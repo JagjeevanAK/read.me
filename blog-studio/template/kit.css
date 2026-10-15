@@ -1,0 +1,176 @@
+/* ==========================================================================
+   Simulation kit: UI building blocks for interactive labs.
+   Everything is scoped to .lab so it never touches article styles.
+   Use these classes in sim.html / generated panel markup:
+     .toolbar .btn(.primary|.danger|.ghost|.sm) .sep
+     .stats > .stat(.ok|.warn|.bad) > b + span
+     .workspace > (.stage + .legend + .hint) + aside.panel
+     .panel h2 .role h3 p .note label(.check) input select dl.kv table.t
+     ul.pods .row .statusgrid .complist .callout .chip
+     .log > h3 + ol > li(.ok|.warn|.bad) > time + span
+   ========================================================================== */
+.lab {
+  --k-surface: var(--card);
+  --k-sunken: color-mix(in srgb, var(--bg-2) 70%, var(--card));
+  --k-line: var(--border);
+  --k-radius: 10px;
+  font: 400 14px/1.5 var(--sans);
+  color: var(--fg);
+}
+.lab h2, .lab h3, .lab p { margin: 0; }
+
+/* ---------- toolbar ---------- */
+.lab .toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 14px; }
+.lab .toolbar .sep { width: 1px; height: 24px; background: var(--k-line); margin: 0 4px; }
+.lab .toolbar .push { margin-left: auto; }
+.lab .btn {
+  display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+  height: 34px; padding: 0 13px; border-radius: 9px;
+  border: 1px solid var(--k-line); background: var(--k-surface); color: var(--fg);
+  font: 500 13.5px/1 var(--sans); white-space: nowrap; cursor: pointer;
+  box-shadow: var(--shadow-sm);
+  transition: border-color .15s ease, color .15s ease, background .15s ease, transform .15s var(--ease), box-shadow .15s ease;
+}
+.lab .btn:hover { border-color: var(--accent-line); color: var(--accent-ink); }
+.lab .btn:active { transform: translateY(1px); }
+.lab .btn.primary {
+  background: linear-gradient(135deg, var(--accent), var(--accent-2)); border-color: transparent; color: #fff; font-weight: 600;
+  box-shadow: 0 6px 16px -6px color-mix(in srgb, var(--accent-2) 70%, transparent);
+}
+.lab .btn.primary:hover { color: #fff; filter: brightness(1.06); }
+.lab .btn.danger { color: var(--bad); }
+.lab .btn.danger:hover { border-color: color-mix(in srgb, var(--bad) 40%, transparent); background: var(--bad-soft); color: var(--bad); }
+.lab .btn.ghost { background: transparent; box-shadow: none; }
+.lab .btn.sm { height: 28px; padding: 0 10px; font-size: 12.5px; border-radius: 7px; }
+.lab .btn:disabled { opacity: .45; cursor: not-allowed; transform: none; }
+.lab select.btn {
+  appearance: none; -webkit-appearance: none; padding-right: 30px;
+  background-image: linear-gradient(45deg, transparent 50%, var(--muted) 50%), linear-gradient(135deg, var(--muted) 50%, transparent 50%);
+  background-position: calc(100% - 15px) 52%, calc(100% - 10px) 52%; background-size: 5px 5px; background-repeat: no-repeat;
+}
+
+/* ---------- stats strip ---------- */
+.lab .stats {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(122px, 1fr)); gap: 1px;
+  background: var(--k-line); border: 1px solid var(--k-line); border-radius: 12px; overflow: hidden; margin-bottom: 14px;
+}
+.lab .stat { background: var(--k-surface); padding: 10px 14px 9px; min-width: 0; }
+.lab .stat b {
+  display: block; font: 600 19px/1.25 var(--mono); letter-spacing: -0.02em; font-variant-numeric: tabular-nums;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; transition: color .3s ease;
+}
+.lab .stat span { font-size: 12px; color: var(--muted); }
+.lab .stat.ok b { color: var(--ok); }
+.lab .stat.warn b { color: var(--warn); }
+.lab .stat.bad b { color: var(--bad); }
+
+/* ---------- workspace: stage + side panel ---------- */
+.lab .workspace { display: grid; grid-template-columns: minmax(0, 1fr) 360px; gap: 14px; align-items: start; }
+@media (max-width: 1080px) { .lab .workspace { grid-template-columns: minmax(0, 1fr); } }
+.lab .stage {
+  position: relative; background: var(--k-surface); border: 1px solid var(--k-line); border-radius: 14px;
+  overflow-x: auto; overflow-y: hidden; box-shadow: var(--shadow-sm);
+  scrollbar-width: thin;
+}
+.lab .stage canvas { display: block; max-width: none; touch-action: manipulation; }
+.lab .legend { display: flex; flex-wrap: wrap; gap: 6px 16px; font-size: 12.5px; color: var(--muted); margin: 10px 4px 0; }
+.lab .legend i { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; vertical-align: 1px; }
+.lab .hint { font-size: 12.5px; color: var(--faint); margin: 6px 4px 0; }
+
+.lab .panel {
+  background: var(--k-surface); border: 1px solid var(--k-line); border-radius: 14px; padding: 18px;
+  max-height: min(820px, calc(100vh - 90px)); overflow: auto; box-shadow: var(--shadow-sm);
+  scrollbar-width: thin;
+}
+@media (max-width: 1080px) { .lab .panel { max-height: none; } }
+.lab:fullscreen .panel { max-height: calc(100vh - 110px); }
+.lab .panel h2 { font-size: 17px; font-weight: 650; letter-spacing: -0.015em; line-height: 1.3; }
+.lab .panel .role { margin: 3px 0 14px; color: var(--muted); font-size: 13px; }
+.lab .panel h3 {
+  font: 600 11px/1 var(--sans); letter-spacing: .12em; text-transform: uppercase; color: var(--faint);
+  margin: 20px 0 8px;
+}
+.lab .panel p { margin: 6px 0; font-size: 13.5px; color: var(--fg-soft); line-height: 1.55; }
+.lab .note { color: var(--muted) !important; font-size: 12.5px !important; line-height: 1.55; }
+.lab .panel label { display: block; font-size: 12.5px; margin: 12px 0 5px; font-weight: 550; color: var(--fg-soft); }
+.lab .panel label.check { display: flex; gap: 9px; align-items: center; font-weight: 400; font-size: 13.5px; margin: 8px 0; cursor: pointer; }
+.lab input[type=text], .lab input[type=number], .lab .panel select {
+  width: 100%; height: 34px; padding: 0 10px; border: 1px solid var(--k-line); border-radius: 8px;
+  background: var(--k-sunken); color: var(--fg); font: 400 13.5px var(--sans);
+  transition: border-color .15s ease, box-shadow .15s ease;
+}
+.lab input[type=text]:focus, .lab input[type=number]:focus, .lab .panel select:focus {
+  outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft);
+}
+.lab input[type=checkbox], .lab input[type=radio] { accent-color: var(--accent); width: 15px; height: 15px; margin: 0; }
+.lab input[type=range] { width: 100%; accent-color: var(--accent); }
+.lab .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.lab .row > * { flex: none; }
+.lab .row b { min-width: 22px; text-align: center; font: 600 14px var(--mono); }
+
+.lab dl.kv { display: grid; grid-template-columns: 1fr auto; gap: 0; margin: 10px 0; font-size: 13.5px; }
+.lab dl.kv dt, .lab dl.kv dd { padding: 6px 0; border-bottom: 1px dashed var(--k-line); }
+.lab dl.kv dt { color: var(--muted); }
+.lab dl.kv dd { margin: 0; font: 500 13px/1.6 var(--mono); font-variant-numeric: tabular-nums; text-align: right; padding-left: 12px; }
+
+.lab ul.pods { list-style: none; margin: 6px 0 10px; padding: 0; display: grid; gap: 5px; }
+.lab ul.pods li {
+  display: flex; align-items: center; gap: 8px; font-size: 13.5px; padding: 5px 6px 5px 12px;
+  background: var(--k-sunken); border: 1px solid var(--k-line); border-radius: 9px;
+}
+.lab ul.pods li .st { margin-left: auto; font-size: 12px; display: inline-flex; align-items: center; gap: 6px; }
+.lab ul.pods li .st::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+.lab .dead { color: var(--bad); }
+.lab .alive { color: var(--ok); }
+
+.lab .tscroll { overflow-x: auto; margin: 0 -2px; }
+.lab table.t { width: 100%; border-collapse: collapse; font-size: 13px; }
+.lab table.t th { font-weight: 600; text-align: left; color: var(--faint); font-size: 11.5px; padding: 6px 6px; border-bottom: 1px solid var(--k-line); white-space: nowrap; }
+.lab table.t td { padding: 6px; border-bottom: 1px solid var(--k-line); vertical-align: middle; }
+.lab table.t tr:last-child td { border-bottom: 0; }
+.lab table.t td.n, .lab table.t th.n { text-align: right; font-family: var(--mono); font-variant-numeric: tabular-nums; }
+.lab table.t input[type=number] { width: 60px; height: 28px; }
+.lab table.t select { width: auto !important; height: 28px !important; }
+
+.lab .statusgrid { display: grid; gap: 5px; }
+.lab .statusgrid label {
+  margin: 0 !important; padding: 8px 10px; border: 1px solid var(--k-line); border-radius: 9px;
+  display: flex !important; gap: 9px; align-items: center; font-weight: 400 !important; cursor: pointer;
+  transition: border-color .15s ease, background .15s ease;
+}
+.lab .statusgrid label:hover { border-color: var(--accent-line); }
+.lab .statusgrid label:has(input:checked) { border-color: var(--accent); background: var(--accent-soft); }
+.lab .callout {
+  border: 1px solid color-mix(in srgb, var(--warn) 30%, transparent); background: var(--warn-soft);
+  padding: 10px 12px; border-radius: 10px; font-size: 13px; margin: 10px 0; color: var(--fg-soft);
+}
+.lab .complist { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+.lab .chip {
+  display: inline-flex; align-items: center; gap: 6px; font: 500 12px/1 var(--sans);
+  padding: 5px 9px; border-radius: 999px; background: var(--accent-soft); color: var(--accent-ink);
+}
+
+/* ---------- event log ---------- */
+.lab .log { margin-top: 18px; border-top: 1px solid var(--k-line); padding-top: 14px; }
+.lab .log h3 { margin-top: 0 !important; }
+.lab .log ol { list-style: none; margin: 0; padding: 0; max-height: 240px; overflow: auto; font-size: 12.5px; scrollbar-width: thin; }
+.lab .log li {
+  padding: 6px 0 6px 10px; border-left: 2px solid var(--k-line); margin-left: 2px;
+  display: grid; grid-template-columns: 40px 1fr; gap: 8px; line-height: 1.45;
+}
+.lab .log li + li { border-top: 1px solid color-mix(in srgb, var(--k-line) 60%, transparent); }
+.lab .log li time { color: var(--faint); font: 500 11.5px/1.6 var(--mono); font-variant-numeric: tabular-nums; }
+.lab .log li span { color: var(--fg-soft); }
+.lab .log li.ok { border-left-color: var(--ok); }
+.lab .log li.warn { border-left-color: var(--warn); }
+.lab .log li.bad { border-left-color: var(--bad); }
+.lab .log li.bad span { color: var(--bad); }
+
+@media (max-width: 640px) {
+  .lab .toolbar { flex-wrap: nowrap; overflow-x: auto; margin: 0 -10px 12px; padding: 2px 10px 6px; scrollbar-width: none; }
+  .lab .toolbar::-webkit-scrollbar { display: none; }
+  .lab .toolbar > * { flex: none; }
+  .lab .toolbar .push { margin-left: 0; }
+  .lab .stats { grid-template-columns: repeat(auto-fit, minmax(104px, 1fr)); }
+  .lab .stat b { font-size: 16px; }
+}

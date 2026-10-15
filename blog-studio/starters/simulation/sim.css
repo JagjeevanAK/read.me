@@ -1,0 +1,4 @@
+/* Simulation-specific colours. Page tokens (--accent, --ok, --bad, --warn, --fg, --muted, --border, --card ...)
+   are already available; add your own here for both themes. */
+:root { --q-in: #0d9488; --q-worker: #4f46e5; --q-grid: #ebe6dd; }
+:root[data-theme="dark"] { --q-in: #2dd4bf; --q-worker: #818cf8; --q-grid: #222a3a; }

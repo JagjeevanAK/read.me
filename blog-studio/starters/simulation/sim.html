@@ -1,0 +1,50 @@
+<div class="toolbar">
+  <button class="btn primary" id="q-pause">Pause</button>
+  <span class="sep" aria-hidden="true"></span>
+  <button class="btn" id="q-burst">Send a burst of 50</button>
+  <button class="btn danger" id="q-kill">Kill a worker</button>
+  <button class="btn" id="q-reset">Reset</button>
+</div>
+
+<div class="stats" id="q-stats"></div>
+
+<div class="workspace">
+  <div>
+    <div class="stage" id="q-stage">
+      <canvas id="q-cv" role="img" aria-label="Messages flowing from a producer into a queue and out to workers"></canvas>
+    </div>
+    <div class="legend">
+      <span><i style="background:var(--q-in)"></i>arriving</span>
+      <span><i style="background:var(--ok)"></i>processed</span>
+      <span><i style="background:var(--bad)"></i>dropped</span>
+    </div>
+    <p class="hint">Each worker handles about 4 messages a second.</p>
+  </div>
+
+  <aside class="panel" aria-live="polite">
+    <h2>Controls</h2>
+    <p class="role">Change the load and the capacity</p>
+
+    <label for="q-rate">Arrival rate: <span id="q-rate-v">8</span> msg/s</label>
+    <input id="q-rate" type="range" min="0" max="40" step="1" value="8">
+
+    <label>Workers</label>
+    <div class="row">
+      <button class="btn sm" data-workers="-1" aria-label="Remove a worker">−</button>
+      <b id="q-workers">3</b>
+      <button class="btn sm" data-workers="1" aria-label="Add a worker">+</button>
+    </div>
+
+    <label for="q-cap">Queue capacity</label>
+    <input id="q-cap" type="number" min="5" max="500" value="60">
+
+    <h3>Right now</h3>
+    <dl class="kv">
+      <dt>Waiting in queue</dt><dd id="q-depth">0</dd>
+      <dt>Oldest message waited</dt><dd id="q-age">0.0s</dd>
+      <dt>Throughput capacity</dt><dd id="q-capacity">12 msg/s</dd>
+    </dl>
+
+    <div class="log"><h3>Events</h3><ol id="q-log"></ol></div>
+  </aside>
+</div>

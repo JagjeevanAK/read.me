@@ -1,0 +1,1110 @@
+/*
+ * WAL delivery system simulation.
+ * Runs inside the exported page with `root` (the lab element) and `Kit` in scope.
+ */
+/* ---------- constants (simulation units are seconds) ---------- */
+const DAY = 10;                 // 1 day of retention = 10 sim seconds
+const PROD_CAP = 60;            // msgs/s per producer pod
+const CONS_CAP = 25;            // deliveries/s per consumer pod
+const PROC_CONC = 4;            // rows in flight per outbox worker
+const PROC_TIME = 1.0;          // seconds to process a row
+const PROC_TIMEOUT = 4;         // processing time limit before retry
+const MAX_ATTEMPTS = 5;         // outbox attempts before DLQ
+const RETRY_SECONDS = [10, 60, 300]; // production retry delays, before jitter
+const RETRY_SPEED = 10;         // retry timers run 10x faster in this demo
+const RETRY_DELAY = RETRY_SECONDS.map(s => s / RETRY_SPEED);
+const TRIP = 20;                // failures in a row that trip a breaker / pause
+const HALF_OPEN = 8;            // main breaker cool-down before half-open probe
+const PROBE = 120 / RETRY_SPEED; // 2 minute retry probe interval, compressed for the demo
+const DLQ_ARCHIVE = 10 * DAY;   // DLQ archived to S3 after 10 days
+const DEDUPE_TTL = 30;          // consumer dedupe set TTL
+const WATCHDOG = 5;             // seconds before watchdog replaces a dead producer pod
+
+const $ = s => root.querySelector(s);
+const esc = s => String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const fmt = n => Math.round(n).toLocaleString("en-US");
+const clone = o => JSON.parse(JSON.stringify(o));
+const rnd = Math.random;
+const clock = t => { const m = Math.floor(t / 60), s = Math.floor(t % 60); return m + ":" + String(s).padStart(2, "0"); };
+
+let S, uid = 0, thr = {};
+const nid = p => p + "-" + (++uid);
+const pod = () => ({ id: nid("pod"), alive: true, diedAt: 0 });
+const mkGen = (name, topic, rate) => ({ id: nid("gen"), name, topic, rate, on: true, acc: 0, sent: 0, rej: 0, lastRej: -99 });
+const mkDest = (id, name, groupId) => ({ id, name, groupId, status: "up", br: { state: "closed", consec: 0, openedAt: 0 }, delivered: 0, deduped: 0, dlq: 0, seen: new Map() });
+const mkRetry = () => ({ steps: [[], [], []], paused: false, pausedBy: null, probeAt: 0, controls: Array.from({ length: 3 }, () => ({ consec: 0, ramp: null, budget: 0, cap: 40 })), lost: 0 });
+const mkGroup = (id, name, type, pods = 2) => ({ id, name, type, pods: Array.from({ length: pods }, pod), offsets: {}, budget: 0, lost: 0, stalled: false, topics: [] });
+
+function initState() {
+  uid = 0; thr = {};
+  const cfg = {
+    topics: [
+      { name: "orders", acks: "all", retention: 7, processing: false },
+      { name: "payments", acks: "all", retention: 7, processing: true },
+      { name: "clickstream", acks: "1", retention: 3, processing: false }
+    ],
+    routing: {
+      orders: ["billing", "analytics", "search", "audit"],
+      payments: ["billing", "audit", "email"],
+      clickstream: ["analytics"]
+    }
+  };
+  S = {
+    t: 0, paused: false, msgSeq: 0,
+    cp: { up: true, version: 1, cfg, pending: null },
+    live: { version: 1, cfg: clone(cfg) },
+    gens: [mkGen("checkout-app", "orders", 8), mkGen("payments-api", "payments", 4), mkGen("web-tracker", "clickstream", 14)],
+    prod: { pods: [pod(), pod(), pod()], watchdog: true, budget: 0 },
+    pg: { up: true },
+    outbox: { rows: [], workers: 2, crashed: false, dlq: 0, stored: 0 },
+    fallback: { q: [] },
+    kafka: { brokers: [true, true, true], topics: {} },
+    retry: {},
+    dlq: { items: [], archived: 0, total: 0 },
+    groups: [
+      mkGroup("g-billing", "billing-consumer", "dedicated"),
+      mkGroup("g-analytics", "analytics-consumer", "dedicated"),
+      mkGroup("g-shared", "shared-consumer-1", "shared")
+    ],
+    dests: [
+      mkDest("billing", "billing-svc", "g-billing"),
+      mkDest("analytics", "analytics", "g-analytics"),
+      mkDest("search", "search-index", "g-shared"),
+      mkDest("audit", "audit-log", "g-shared"),
+      mkDest("email", "email-service", "g-shared")
+    ],
+    stats: { ingested: 0, delivered: 0, rejected: 0, lost: 0, deduped: 0 },
+    bucket: { in: 0, out: 0, t: 0 }, rates: { in: 0, out: 0 },
+    sel: null, mode: null, log: []
+  };
+  cfg.topics.forEach(t => ensureTopic(t.name));
+  S.dests.forEach(d => S.retry[d.id] = mkRetry());
+  log("Simulation started with default data", "ok");
+}
+
+/* ---------- helpers ---------- */
+function ensureTopic(name) { if (!S.kafka.topics[name]) S.kafka.topics[name] = { base: 0, msgs: [] }; }
+const endOff = tp => tp.base + tp.msgs.length;
+const aliveBrokers = () => S.kafka.brokers.filter(Boolean).length;
+const kOK = acks => acks === "1" ? aliveBrokers() >= 1 : aliveBrokers() >= 2;
+const topicCfg = name => S.live.cfg.topics.find(t => t.name === name);
+const destById = id => S.dests.find(d => d.id === id);
+const groupById = id => S.groups.find(g => g.id === id);
+const aliveCount = pods => pods.filter(p => p.alive).length;
+const retryWaiting = r => r.steps[0].length + r.steps[1].length + r.steps[2].length;
+const retryStepState = (r, s) => { const c = r.controls[s]; return r.paused ? "paused" : c.ramp ? `ramping ${c.cap}/s` : "active"; };
+const retrySummary = r => r.controls.map((c, s) => `S${s + 1}: ${retryStepState(r, s)}`).join(" · ");
+
+let logDirty = true, panelDirty = true;
+function log(text, kind = "info") { S.log.unshift({ t: S.t, text, kind }); if (S.log.length > 80) S.log.pop(); logDirty = true; }
+function logT(key, text, kind, gap = 4) { if (S.t - (thr[key] ?? -99) >= gap) { thr[key] = S.t; log(text, kind); } }
+function markCfg(what) {
+  S.cp.version++;
+  S.cp.pending = { readyAt: S.t + 1.5 };
+  log(`Control plane saved config v${S.cp.version}: ${what}`, "info");
+}
+
+/* ---------- simulation ---------- */
+function step(dt) {
+  S.t += dt;
+  cpTick(); watchdogTick(); genTick(dt); fallbackTick(dt); outboxTick();
+  groupsTick(dt); retryTick(dt); retentionTick(); dlqTick(); dedupePrune(); rateTick();
+}
+
+function cpTick() {
+  const p = S.cp.pending;
+  if (p && S.cp.up && aliveBrokers() >= 1 && S.t >= p.readyAt) {
+    S.live.cfg = clone(S.cp.cfg); S.live.version = S.cp.version; S.cp.pending = null;
+    S.live.cfg.topics.forEach(t => ensureTopic(t.name));
+    log(`Config v${S.live.version} reconciled with Kafka and pushed to producers and consumers`, "ok");
+    panelDirty = true;
+  }
+}
+
+function watchdogTick() {
+  if (!S.prod.watchdog) return;
+  for (const p of S.prod.pods) if (!p.alive && S.t - p.diedAt >= WATCHDOG) {
+    p.alive = true; log("Watchdog replaced a dead producer pod", "ok"); panelDirty = true;
+  }
+}
+
+function genTick(dt) {
+  const alive = aliveCount(S.prod.pods);
+  S.prod.budget = Math.min(S.prod.budget + alive * PROD_CAP * dt, alive * PROD_CAP);
+  for (const g of S.gens) {
+    if (!g.on || g.rate <= 0) continue;
+    g.acc += g.rate * dt;
+    while (g.acc >= 1) { g.acc--; intake(g, alive); }
+  }
+}
+
+function intake(g, alive) {
+  const tc = topicCfg(g.topic);
+  const reject = why => {
+    g.rej++; g.lastRej = S.t; S.stats.rejected++;
+    emit("gen:" + g.id, "r", "prod", "l", "bad");
+    logT("rej" + g.id + why, `${g.name}: request rejected (${why})`, "bad", 5);
+  };
+  if (!tc) return reject("unknown topic " + g.topic);
+  if (!alive) return reject("503, no producer pods alive");
+  let route = null;
+  if (tc.processing) route = S.pg.up ? "outbox" : null;
+  else if (kOK(tc.acks)) route = "kafka";
+  else route = S.pg.up ? "fallback" : null;
+  if (!route) return reject(tc.processing ? "503, Postgres down" : "503, Kafka and Postgres down");
+  if (S.prod.budget < 1) return reject("429, producer at capacity");
+  S.prod.budget--;
+  const msg = { id: ++S.msgSeq, key: "idk-" + S.msgSeq, topic: tc.name, t: S.t, processed: false };
+  g.sent++; S.stats.ingested++; S.bucket.in++;
+  emit("gen:" + g.id, "r", "prod", "l", "prod");
+  if (route === "kafka") { append(tc.name, msg); emit("prod", "r", "ktopic:" + tc.name, "l", "prod"); }
+  else if (route === "outbox") { S.outbox.rows.push({ msg, state: "pending", startedAt: 0, attempts: 0 }); emit("prod", "b", "outbox", "t", "pg"); }
+  else {
+    S.fallback.q.push(msg); emit("prod", "l", "fallback", "l", "retry", -70);
+    logT("fb", `Kafka can't ack ${tc.name} (acks=${tc.acks}), producer writing to fallback buffer`, "warn", 6);
+  }
+}
+
+function append(name, msg) { ensureTopic(name); S.kafka.topics[name].msgs.push({ ...msg, kt: S.t }); }
+
+function fallbackTick(dt) {
+  const q = S.fallback.q; if (!q.length) return;
+  let n = Math.max(1, Math.ceil(150 * dt));
+  for (let i = 0; i < q.length && n > 0;) {
+    const m = q[i], tc = topicCfg(m.topic);
+    if (tc && kOK(tc.acks)) { append(m.topic, m); q.splice(i, 1); n--; emit("fallback", "r", "ktopic:" + m.topic, "l", "retry"); }
+    else i++;
+  }
+  if (!q.length) log("Fallback buffer drained into Kafka", "ok");
+}
+
+function outboxTick() {
+  const ob = S.outbox; if (!S.pg.up) return;
+  const cap = ob.workers * PROC_CONC;
+  let inflight = 0;
+  for (const r of ob.rows) {
+    if (r.state !== "processing") continue;
+    if (!ob.crashed && S.t - r.startedAt >= PROC_TIME) { r.state = "processed"; }
+    else if (S.t - r.startedAt >= PROC_TIMEOUT) {
+      r.attempts++;
+      if (r.attempts >= MAX_ATTEMPTS) {
+        r.state = "dlq"; ob.dlq++; emit("outbox", "b", "fallback", "t", "bad");
+        logT("obdlq", `Outbox row hit ${MAX_ATTEMPTS} attempts, moved to outbox DLQ`, "bad", 5);
+      } else { r.state = "pending"; logT("obto", "Outbox row passed processing time limit, retrying processing", "warn", 5); }
+    } else inflight++;
+  }
+  for (const r of ob.rows) {
+    if (inflight >= cap) break;
+    if (r.state === "pending") { r.state = "processing"; r.startedAt = S.t; inflight++; }
+  }
+  for (const r of ob.rows) {
+    if (r.state !== "processed") continue;
+    const tc = topicCfg(r.msg.topic);
+    if (tc && kOK(tc.acks)) {
+      append(r.msg.topic, { ...r.msg, processed: true }); r.state = "stored"; ob.stored++;
+      emit("outbox", "r", "ktopic:" + r.msg.topic, "l", "pg");
+    }
+  }
+  if (ob.rows.some(r => r.state === "stored" || r.state === "dlq")) ob.rows = ob.rows.filter(r => r.state !== "stored" && r.state !== "dlq");
+}
+
+function attempt(d) {
+  switch (d.status) {
+    case "up": case "slow": return "ok";
+    case "flaky": return rnd() < 0.4 ? "transient" : "ok";
+    case "down": return "transient";
+    case "reject": return "permanent";
+  }
+  return "ok";
+}
+
+function delivered(d, msg) {
+  d.delivered++; d.seen.set(msg.key, S.t); S.stats.delivered++; S.bucket.out++;
+}
+
+function toRetry(d, msg, step) {
+  S.retry[d.id].steps[step].push({ msg, due: S.t + RETRY_DELAY[step] * (0.7 + rnd() * 0.6), at: S.t });
+}
+function toDLQ(msg, d, reason) {
+  S.dlq.items.push({ msg, dest: d.id, reason, at: S.t }); S.dlq.total++; d.dlq++;
+  logT("dlq" + d.id + reason, `${d.name}: message sent to DLQ (${reason}), alert raised in telemetry`, "bad", 5);
+}
+
+function groupsTick(dt) {
+  const kb = aliveBrokers(), routing = S.live.cfg.routing;
+  for (const g of S.groups) {
+    g.stalled = false;
+    const dests = S.dests.filter(d => d.groupId === g.id);
+    const ids = new Set(dests.map(d => d.id));
+    g.topics = Object.keys(routing).filter(t => topicCfg(t) && routing[t].some(id => ids.has(id)));
+    for (const t of g.topics) { ensureTopic(t); if (g.offsets[t] == null) g.offsets[t] = endOff(S.kafka.topics[t]); }
+    const alive = aliveCount(g.pods);
+    if (!alive || kb < 1) { g.budget = 0; continue; }
+    const cap = alive * CONS_CAP;
+    g.budget = Math.min(g.budget + cap * dt, Math.max(4, cap * 0.5));
+    let progress = true;
+    while (progress && g.budget > 0) {
+      progress = false;
+      for (const t of g.topics) {
+        const tp = S.kafka.topics[t], off = g.offsets[t];
+        if (off >= endOff(tp)) continue;
+        const msg = tp.msgs[off - tp.base];
+        const ds = dests.filter(d => routing[t].includes(d.id));
+        const cost = ds.reduce((s, d) => s + (d.status === "slow" ? 4 : 1), 0) || 1;
+        if (g.budget < cost) continue;
+        const mayWrite = ds.some(d => d.status === "down" || d.status === "flaky" || d.status === "reject" || d.br.state !== "closed");
+        if (mayWrite && kb < 2) { g.stalled = true; continue; }
+        g.budget -= cost;
+        for (const d of ds) mainDeliver(g, d, msg);
+        g.offsets[t] = off + 1; progress = true;
+      }
+    }
+    if (g.stalled) logT("stall" + g.id, `${g.name} can't write to retry topics (needs 2 brokers), holding offsets uncommitted`, "warn", 6);
+  }
+}
+
+function mainDeliver(g, d, msg) {
+  const from = "group:" + g.id;
+  if (d.seen.has(msg.key)) { d.deduped++; S.stats.deduped++; return; }
+  // A coordinated retry pause also suppresses separate main-consumer probes.
+  // Only the single retry recovery probe may contact this destination while paused.
+  if (S.retry[d.id].paused) { toRetry(d, msg, 0); emit(from, "r", "retry:" + d.id, "r", "retry", 40); return; }
+  const br = d.br;
+  if (br.state === "open") {
+    if (S.t - br.openedAt >= HALF_OPEN) { br.state = "half"; }
+    else { toRetry(d, msg, 0); emit(from, "r", "retry:" + d.id, "r", "retry", 40); return; }
+  }
+  const res = attempt(d);
+  if (res === "ok") {
+    delivered(d, msg); emit(from, "r", "dest:" + d.id, "l", "ok"); br.consec = 0;
+    if (br.state === "half") { br.state = "closed"; log(`${d.name}: half-open probe went through, breaker closed`, "ok"); }
+  } else if (res === "transient") {
+    br.consec++; toRetry(d, msg, 0); emit(from, "r", "retry:" + d.id, "r", "retry", 40);
+    if (br.state === "half") { br.state = "open"; br.openedAt = S.t; logT("hp" + d.id, `${d.name}: half-open probe failed, breaker stays open`, "bad", 6); }
+    else if (br.state === "closed" && br.consec >= TRIP) {
+      br.state = "open"; br.openedAt = S.t;
+      log(`${d.name}: breaker opened after ${TRIP} failures in a row, new messages queue in retry step 1 even while that step is paused`, "bad");
+    }
+  } else {
+    br.consec = 0; toDLQ(msg, d, "400 bad request, permanent"); emit(from, "r", "dlq", "r", "bad", 60);
+  }
+}
+
+function retryTick(dt) {
+  // Failed deliveries must be durably handed off before their retry offset advances.
+  if (!kOK("all")) return;
+  for (const d of S.dests) {
+    const r = S.retry[d.id]; if (!r) continue;
+    if (r.paused) {
+      r.controls.forEach(c => c.budget = 0);
+      if (S.t < r.probeAt) continue;
+      // One coordinated probe for the destination, selected from any due retry queue.
+      for (let s = 0; s < 3; s++) {
+        const q = r.steps[s];
+        const i = q.findIndex(it => it.due <= S.t);
+        if (i < 0) continue;
+        const item = q[i];
+        if (d.seen.has(item.msg.key)) { q.splice(i, 1); d.deduped++; S.stats.deduped++; continue; }
+        const res = attempt(d);
+        emit("rc", "r", "dest:" + d.id, "l", res === "ok" ? "ok" : "bad");
+        if (res === "transient") {
+          r.probeAt = S.t + PROBE;
+          logT("pr" + d.id, `${d.name}: recovery probe failed, all retry steps stay paused`, "bad", 6);
+        } else {
+          q.splice(i, 1);
+          if (res === "ok") delivered(d, item.msg);
+          else { toDLQ(item.msg, d, "400 bad request, permanent"); emit("rc", "b", "dlq", "r", "bad"); }
+          r.paused = false; r.pausedBy = null; r.probeAt = 0;
+          r.controls.forEach(c => { c.consec = 0; c.ramp = { at: S.t }; c.cap = 2; c.budget = 0; });
+          d.br.state = "closed"; d.br.consec = 0;
+          log(`${d.name}: recovery probe ${res === "ok" ? "succeeded" : "received a permanent response; message sent to DLQ"}, resuming all retry steps with backpressure`, "ok");
+        }
+        break;
+      }
+      continue;
+    }
+    for (let s = 0; s < 3 && !r.paused; s++) {
+      const q = r.steps[s], c = r.controls[s];
+      if (!q.length) { c.budget = 0; continue; }
+      let cap = 40;
+      if (c.ramp) { cap = Math.min(40, 2 * 2 ** Math.floor((S.t - c.ramp.at) / 1.5)); if (cap >= 40) c.ramp = null; }
+      c.cap = cap;
+      c.budget = Math.min(c.budget + cap * dt, Math.max(1, cap * 0.5));
+      for (let i = 0; i < q.length && c.budget >= 1 && !r.paused;) {
+        const it = q[i];
+        if (it.due > S.t) { i++; continue; }
+        q.splice(i, 1); c.budget--;
+        emit("retry:" + d.id, "r", "rc", "l", "retry");
+        if (d.seen.has(it.msg.key)) { d.deduped++; S.stats.deduped++; continue; }
+        const res = attempt(d);
+        if (res === "ok") { delivered(d, it.msg); c.consec = 0; emit("rc", "r", "dest:" + d.id, "l", "ok"); }
+        else if (res === "permanent") { c.consec = 0; toDLQ(it.msg, d, "400 bad request, permanent"); emit("rc", "b", "dlq", "r", "bad"); }
+        else {
+          c.consec++;
+          emit("rc", "r", "dest:" + d.id, "l", "bad");
+          if (s < 2) toRetry(d, it.msg, s + 1);
+          else { toDLQ(it.msg, d, "retries exhausted"); emit("rc", "b", "dlq", "r", "bad"); }
+          if (c.consec >= TRIP) {
+            r.paused = true; r.pausedBy = s; r.probeAt = S.t + PROBE;
+            r.controls.forEach(control => { control.budget = 0; control.ramp = null; });
+            log(`${d.name}: retry step ${s + 1} failed ${TRIP} times in a row; all retry steps paused, new messages still queue in step 1`, "bad");
+          }
+        }
+      }
+    }
+  }
+}
+
+function retentionTick() {
+  for (const [name, tp] of Object.entries(S.kafka.topics)) {
+    const tc = topicCfg(name), days = tc ? tc.retention : 7, ret = days * DAY;
+    let drop = 0;
+    while (drop < tp.msgs.length && S.t - tp.msgs[drop].kt > ret) drop++;
+    if (!drop) continue;
+    tp.msgs.splice(0, drop); tp.base += drop;
+    for (const g of S.groups) {
+      const o = g.offsets[name];
+      if (o != null && g.topics.includes(name) && o < tp.base) {
+        const n = tp.base - o; g.lost += n; S.stats.lost += n; g.offsets[name] = tp.base;
+        logT("lost" + g.id + name, `${n} messages on ${name} expired after ${days} days before ${g.name} read them`, "bad", 5);
+      }
+    }
+  }
+  const rret = 14 * DAY;
+  for (const d of S.dests) {
+    const r = S.retry[d.id]; if (!r) continue;
+    for (let s = 0; s < 3; s++) {
+      const before = r.steps[s].length;
+      if (!before || S.t - r.steps[s][0].at <= rret) continue;
+      r.steps[s] = r.steps[s].filter(it => S.t - it.at <= rret);
+      const n = before - r.steps[s].length; r.lost += n; S.stats.lost += n;
+      logT("rlost" + d.id, `${n} retry messages for ${d.name} expired after 14 days`, "bad", 5);
+    }
+  }
+}
+
+function dlqTick() {
+  const items = S.dlq.items;
+  if (items.length && S.t - items[0].at > DLQ_ARCHIVE) {
+    const keep = items.filter(it => S.t - it.at <= DLQ_ARCHIVE);
+    const n = items.length - keep.length; S.dlq.items = keep; S.dlq.archived += n;
+    emit("dlq", "r", "s3", "l", "bad");
+    logT("arch", `Archive worker moved ${n} DLQ logs older than 10 days to S3`, "info", 5);
+  }
+}
+
+let lastPrune = 0;
+function dedupePrune() {
+  if (S.t - lastPrune < 1) return; lastPrune = S.t;
+  for (const d of S.dests) for (const [k, t] of d.seen) if (S.t - t > DEDUPE_TTL) d.seen.delete(k);
+}
+
+function rateTick() {
+  const span = S.t - S.bucket.t;
+  if (span >= 1) {
+    S.rates.in = S.rates.in * 0.4 + (S.bucket.in / span) * 0.6;
+    S.rates.out = S.rates.out * 0.4 + (S.bucket.out / span) * 0.6;
+    S.bucket = { in: 0, out: 0, t: S.t };
+  }
+}
+
+/* ---------- actions ---------- */
+function killProdPod(p) { p.alive = false; p.diedAt = S.t; log(`Producer pod killed${S.prod.watchdog ? ", watchdog will replace it" : ""}`, "bad"); }
+function killConsPod(g, p) {
+  p.alive = false; p.diedAt = S.t;
+  for (const t of g.topics) { const tp = S.kafka.topics[t]; if (tp && g.offsets[t] != null) g.offsets[t] = Math.max(tp.base, g.offsets[t] - 6); }
+  log(`${g.name}: pod killed, its uncommitted messages will be redelivered (dedupe catches repeats)`, "bad");
+}
+function setDest(d, status) {
+  d.status = status;
+  const label = { up: "healthy", slow: "slow", flaky: "flaky", down: "down", reject: "rejecting with 400s" }[status];
+  log(`${d.name} is now ${label}`, status === "up" ? "ok" : "bad");
+}
+function setBroker(i, on) {
+  S.kafka.brokers[i] = on;
+  log(`Kafka broker ${i + 1} ${on ? "back up" : "down"}, ${aliveBrokers()} of 3 alive`, on ? "ok" : "bad");
+}
+function heal() {
+  S.dests.forEach(d => d.status = "up");
+  S.kafka.brokers = [true, true, true];
+  S.pg.up = true; S.outbox.crashed = false; S.cp.up = true;
+  S.prod.pods.forEach(p => p.alive = true);
+  S.groups.forEach(g => g.pods.forEach(p => p.alive = true));
+  log("Healed everything. Breakers and paused partitions recover through their probes", "ok");
+}
+function scenario(v) {
+  const dn = name => S.dests.find(d => d.name === name) || S.dests[0];
+  switch (v) {
+    case "dest-down": { const d = dn("search-index"); if (d) { setDest(d, "down"); select("dest", d.id); } break; }
+    case "dest-reject": { const d = dn("audit-log"); if (d) { setDest(d, "reject"); select("dest", d.id); } break; }
+    case "dest-flaky": { const d = dn("email-service"); if (d) { setDest(d, "flaky"); select("dest", d.id); } break; }
+    case "dest-slow": { const d = dn("search-index"); if (d) { setDest(d, "slow"); select("dest", d.id); } break; }
+    case "broker": { const i = S.kafka.brokers.findIndex(Boolean); if (i >= 0) setBroker(i, false); select("kafka"); break; }
+    case "kafka-out": S.kafka.brokers = [false, false, false]; log("Kafka outage, all brokers down", "bad"); select("kafka"); break;
+    case "processor": S.outbox.crashed = true; log("Outbox processor is crashing mid-processing", "bad"); select("outbox"); break;
+    case "pg": S.pg.up = false; log("Postgres is down, outbox and fallback buffer unavailable", "bad"); select("outbox"); break;
+    case "cp": S.cp.up = false; log("Control plane is down, nodes keep running on cached config", "bad"); select("cp"); break;
+    case "kill-shared": { const g = S.groups.find(x => x.type === "shared"); if (g) { g.pods.forEach(p => p.alive && killConsPod(g, p)); select("group", g.id); } break; }
+    case "kill-prod": S.prod.pods.forEach(p => p.alive && killProdPod(p)); select("prod"); break;
+  }
+}
+function select(kind, id) { S.sel = { kind, id }; S.mode = null; panelDirty = true; }
+
+/* ---------- canvas ---------- */
+const cv = $("#cv");
+let ctx = cv.getContext("2d");
+const W = 1280; let H = 760, scale = 1, dpr = 1, LAY = {}, HITS = [];
+let C = {};
+function readColors() {
+  C = Kit.colors(["surface", "surface-2", "ink", "muted", "line", "grid", "accent", "shadow", "prod", "kafka", "cons", "dest", "cp", "pg", "ok", "retry", "bad"]);
+}
+const FONT = Kit.font.sans;
+
+function layout() {
+  const L = {}; HITS = [];
+  const add = (key, r, kind, id) => { L[key] = r; if (kind) HITS.push({ r, kind, id }); };
+  add("cp", { x: 240, y: 16, w: 750, h: 48 }, "cp");
+  let y = 100;
+  S.gens.forEach(g => { add("gen:" + g.id, { x: 20, y, w: 180, h: 62 }, "gen", g.id); y += 76; });
+  let bottom = y;
+  const prows = Math.max(1, Math.ceil(S.prod.pods.length / 7));
+  add("prod", { x: 240, y: 100, w: 190, h: 54 + prows * 24 }, "prod");
+  add("outbox", { x: 240, y: L.prod.y + L.prod.h + 30, w: 190, h: 120 }, "outbox");
+  add("fallback", { x: 240, y: L.outbox.y + L.outbox.h + 26, w: 190, h: 58 }, "fallback");
+  bottom = Math.max(bottom, L.fallback.y + L.fallback.h);
+  const topics = S.live.cfg.topics.map(t => t.name);
+  add("kafka", { x: 480, y: 100, w: 260, h: 60 + topics.length * 30 }, "kafka");
+  topics.forEach((n, i) => { L["ktopic:" + n] = { x: 488, y: 100 + 54 + i * 30, w: 244, h: 26 }; });
+  add("retry", { x: 480, y: L.kafka.y + L.kafka.h + 28, w: 260, h: 44 + S.dests.length * 22 }, "retry");
+  S.dests.forEach((d, i) => { L["retry:" + d.id] = { x: 488, y: L.retry.y + 40 + i * 22, w: 244, h: 20 }; });
+  add("dlq", { x: 480, y: L.retry.y + L.retry.h + 24, w: 164, h: 60 }, "dlq");
+  add("s3", { x: 654, y: L.dlq.y, w: 86, h: 60 }, "dlq");
+  bottom = Math.max(bottom, L.dlq.y + L.dlq.h);
+  y = 100;
+  S.groups.forEach(g => {
+    const rows = Math.max(1, Math.ceil(g.pods.length / 7));
+    add("group:" + g.id, { x: 790, y, w: 205, h: 56 + rows * 22 }, "group", g.id); y += 56 + rows * 22 + 14;
+  });
+  add("rc", { x: 790, y: Math.max(y + 12, L.retry.y), w: 205, h: 60 }, "rc");
+  bottom = Math.max(bottom, L.rc.y + L.rc.h);
+  y = 100;
+  S.dests.forEach(d => { add("dest:" + d.id, { x: 1045, y, w: 215, h: 70 }, "dest", d.id); y += 82; });
+  bottom = Math.max(bottom, y);
+  L._H = Math.max(560, bottom + 24);
+  return L;
+}
+
+function fitCanvas() {
+  ({ ctx, scale, dpr } = Kit.fitCanvas(cv, W, H, { container: $("#cvwrap"), min: 0.68, max: 1.25 }));
+}
+
+function rr(x, y, w, h, r) { ctx.beginPath(); ctx.roundRect ? ctx.roundRect(x, y, w, h, r) : ctx.rect(x, y, w, h); }
+function text(s, x, y, size = 12, color = C.ink, weight = 400, align = "left") {
+  ctx.font = `${weight} ${size}px ${FONT}`; ctx.fillStyle = color; ctx.textAlign = align; ctx.textBaseline = "alphabetic"; ctx.fillText(s, x, y);
+}
+function fit(s, maxW, size, weight = 400) {
+  ctx.font = `${weight} ${size}px ${FONT}`;
+  if (ctx.measureText(s).width <= maxW) return s;
+  while (s.length > 1 && ctx.measureText(s + "…").width > maxW) s = s.slice(0, -1);
+  return s + "…";
+}
+function pill(s, xRight, y, color) {
+  ctx.font = `600 10.5px ${FONT}`;
+  const w = ctx.measureText(s).width + 12, x = xRight - w;
+  ctx.globalAlpha = 0.16; ctx.fillStyle = color; rr(x, y - 11, w, 16, 8); ctx.fill(); ctx.globalAlpha = 1;
+  text(s, x + 6, y + 1, 10.5, color, 600);
+  return x;
+}
+function box(key, accent, title, opts = {}) {
+  const r = LAY[key];
+  const sel = opts.sel;
+  if (sel) { ctx.globalAlpha = 0.18; ctx.fillStyle = C.accent; rr(r.x - 4, r.y - 4, r.w + 8, r.h + 8, 13); ctx.fill(); ctx.globalAlpha = 1; }
+  ctx.save(); ctx.shadowColor = C.shadow; ctx.shadowBlur = 16; ctx.shadowOffsetY = 5;
+  ctx.fillStyle = C.surface; rr(r.x, r.y, r.w, r.h, 10); ctx.fill(); ctx.restore();
+  ctx.lineWidth = sel ? 1.5 : 1; ctx.strokeStyle = opts.down ? C.bad : sel ? C.accent : C.line;
+  if (opts.down) ctx.setLineDash([5, 4]);
+  rr(r.x, r.y, r.w, r.h, 10); ctx.stroke(); ctx.setLineDash([]);
+  ctx.fillStyle = opts.down ? C.bad : accent; rr(r.x, r.y + 10, 3, r.h - 20, 2); ctx.fill();
+  if (title) text(fit(title, r.w - (opts.titleRoom || 24), 13, 600), r.x + 14, r.y + 21, 13, C.ink, 600);
+  return r;
+}
+function podRow(pods, x, y, color) {
+  pods.forEach((p, i) => {
+    const px = x + (i % 7) * 24, py = y + Math.floor(i / 7) * 22;
+    if (p.alive) { ctx.fillStyle = color; rr(px, py, 18, 16, 3); ctx.fill(); }
+    else {
+      ctx.strokeStyle = C.bad; ctx.lineWidth = 1.5; rr(px + .75, py + .75, 16.5, 14.5, 3); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(px + 5, py + 4); ctx.lineTo(px + 13, py + 12); ctx.moveTo(px + 13, py + 4); ctx.lineTo(px + 5, py + 12); ctx.stroke();
+    }
+  });
+}
+function anchor(key, side) {
+  const r = LAY[key]; if (!r) return null;
+  switch (side) {
+    case "l": return { x: r.x, y: r.y + r.h / 2 };
+    case "r": return { x: r.x + r.w, y: r.y + r.h / 2 };
+    case "t": return { x: r.x + r.w / 2, y: r.y };
+    case "b": return { x: r.x + r.w / 2, y: r.y + r.h };
+  }
+}
+function ctrl(a, b, curve) {
+  const mx = (a.x + b.x) / 2, my = (a.y + b.y) / 2;
+  if (!curve) return { x: mx, y: my };
+  const dx = b.x - a.x, dy = b.y - a.y, len = Math.hypot(dx, dy) || 1;
+  return { x: mx - dy / len * curve, y: my + dx / len * curve };
+}
+function link(a, b, opts = {}) {
+  if (!a || !b) return;
+  const c = ctrl(a, b, opts.curve || 0);
+  ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.quadraticCurveTo(c.x, c.y, b.x, b.y);
+  ctx.strokeStyle = opts.color || C.line; ctx.lineWidth = opts.w || 1.2;
+  if (opts.dash) ctx.setLineDash(opts.dash);
+  ctx.stroke(); ctx.setLineDash([]);
+}
+
+/* dots */
+const dots = []; const lastEmit = {};
+function emit(fromKey, fs, toKey, ts, color, curve = 0) {
+  if (document.hidden || !LAY[fromKey] || !LAY[toKey]) return;
+  const k = fromKey + ">" + toKey + color, now = performance.now();
+  if ((lastEmit[k] || 0) > now - 85 || dots.length > 520) return;
+  lastEmit[k] = now;
+  const a = anchor(fromKey, fs), b = anchor(toKey, ts);
+  dots.push({ a, b, c: ctrl(a, b, curve), t0: now, dur: 620 + rnd() * 220, color });
+}
+function drawDots(now) {
+  for (let i = dots.length - 1; i >= 0; i--) {
+    const d = dots[i], p = (now - d.t0) / d.dur;
+    if (p >= 1) { dots.splice(i, 1); continue; }
+    const e = p < .5 ? 2 * p * p : 1 - (-2 * p + 2) ** 2 / 2, u = 1 - e;
+    const x = u * u * d.a.x + 2 * u * e * d.c.x + e * e * d.b.x;
+    const y = u * u * d.a.y + 2 * u * e * d.c.y + e * e * d.b.y;
+    ctx.fillStyle = C[d.color] || C.ink;
+    ctx.globalAlpha = 0.2; ctx.beginPath(); ctx.arc(x, y, 6.5, 0, Math.PI * 2); ctx.fill(); ctx.globalAlpha = 1;
+    ctx.beginPath(); ctx.arc(x, y, 3.3, 0, Math.PI * 2); ctx.fill();
+  }
+}
+
+const isSel = (kind, id) => S.sel && S.sel.kind === kind && (id === undefined || S.sel.id === id);
+
+function draw(now) {
+  LAY = layout(); H = LAY._H; fitCanvas();
+  ctx.clearRect(0, 0, W, H);
+  ctx.fillStyle = C.grid;
+  for (let x = 12; x < W; x += 24) for (let y = 12; y < H; y += 24) ctx.fillRect(x, y, 1.6, 1.6);
+
+  /* static links */
+  const cpA = anchor("cp", "b");
+  link({ x: 335, y: 64 }, anchor("prod", "t"), { dash: [4, 4], color: C.cp });
+  link({ x: 610, y: 64 }, anchor("kafka", "t"), { dash: [4, 4], color: C.cp });
+  if (S.groups.length) link({ x: 892, y: 64 }, anchor("group:" + S.groups[0].id, "t"), { dash: [4, 4], color: C.cp });
+  S.gens.forEach(g => link(anchor("gen:" + g.id, "r"), anchor("prod", "l")));
+  link(anchor("prod", "r"), anchor("kafka", "l"));
+  link(anchor("prod", "b"), anchor("outbox", "t"));
+  link(anchor("outbox", "r"), anchor("kafka", "l"));
+  link(anchor("prod", "l"), anchor("fallback", "l"), { curve: -70 });
+  link(anchor("fallback", "r"), anchor("kafka", "l"));
+  S.groups.forEach(g => link(anchor("kafka", "r"), anchor("group:" + g.id, "l")));
+  S.dests.forEach(d => { if (d.groupId) link(anchor("group:" + d.groupId, "r"), anchor("dest:" + d.id, "l")); });
+  link(anchor("retry", "r"), anchor("rc", "l"));
+  link(anchor("dlq", "r"), anchor("s3", "l"));
+
+  /* control plane */
+  {
+    const r = box("cp", C.cp, "Control plane", { sel: isSel("cp"), down: !S.cp.up });
+    const sub = S.cp.pending ? `saved v${S.cp.version}, reconciling with Kafka…` : `config v${S.cp.version} saved, v${S.live.version} live on nodes`;
+    text(sub, r.x + 14, r.y + 38, 12, S.cp.pending ? C.retry : C.muted);
+    pill(S.cp.up ? "up" : "down, nodes on cached config", r.x + r.w - 10, r.y + 22, S.cp.up ? C.ok : C.bad);
+  }
+  /* generators */
+  S.gens.forEach(g => {
+    const r = box("gen:" + g.id, C.prod, g.name, { sel: isSel("gen", g.id), titleRoom: 70 });
+    text(g.on ? `${g.rate} msg/s to ${g.topic}` : "paused", r.x + 14, r.y + 39, 12, C.muted);
+    text(`${fmt(g.sent)} sent`, r.x + 14, r.y + 55, 11.5, C.muted);
+    if (S.t - g.lastRej < 1.2) pill("rejected", r.x + r.w - 10, r.y + 21, C.bad);
+  });
+  /* producer */
+  {
+    const alive = aliveCount(S.prod.pods);
+    const r = box("prod", C.prod, "Producer service", { sel: isSel("prod"), down: alive === 0 });
+    text(`behind LB, watchdog ${S.prod.watchdog ? "on" : "off"}`, r.x + 14, r.y + 38, 12, C.muted);
+    podRow(S.prod.pods, r.x + 14, r.y + 48, C.prod);
+  }
+  /* outbox */
+  {
+    const ob = S.outbox, r = box("outbox", C.pg, "Outbox (Postgres)", { sel: isSel("outbox"), down: !S.pg.up });
+    const c = { pending: 0, processing: 0, processed: 0 };
+    ob.rows.forEach(x => { if (c[x.state] != null) c[x.state]++; });
+    const cells = [["pending", c.pending, C.ink], ["processing", c.processing, C.ink], ["processed", c.processed, C.ink], ["DLQ", ob.dlq, ob.dlq ? C.bad : C.ink]];
+    cells.forEach(([lbl, n, col], i) => {
+      const cx = r.x + 14 + (i % 2) * 88, cy = r.y + 44 + Math.floor(i / 2) * 32;
+      text(lbl, cx, cy, 11, C.muted); text(fmt(n), cx, cy + 16, 15, col, 600);
+    });
+    text(ob.crashed ? "processor crashing" : `processor: ${ob.workers} workers`, r.x + 14, r.y + 111, 11.5, ob.crashed ? C.bad : C.muted);
+    if (!S.pg.up) pill("down", r.x + r.w - 10, r.y + 21, C.bad);
+  }
+  /* fallback */
+  {
+    const n = S.fallback.q.length, r = box("fallback", C.retry, "Fallback buffer", { sel: isSel("fallback") });
+    text(n ? `${fmt(n)} waiting for Kafka` : "empty", r.x + 14, r.y + 40, 12, n ? C.retry : C.muted);
+  }
+  /* kafka */
+  {
+    const ab = aliveBrokers(), r = box("kafka", C.kafka, "Kafka", { sel: isSel("kafka"), down: ab === 0 });
+    S.kafka.brokers.forEach((on, i) => {
+      const bx = r.x + r.w - 92 + i * 28, by = r.y + 17;
+      ctx.beginPath(); ctx.arc(bx, by, 9, 0, Math.PI * 2);
+      if (on) { ctx.fillStyle = C.kafka; ctx.fill(); text(String(i + 1), bx, by + 4, 10.5, C.surface, 700, "center"); }
+      else { ctx.strokeStyle = C.bad; ctx.lineWidth = 1.5; ctx.stroke(); text(String(i + 1), bx, by + 4, 10.5, C.bad, 700, "center"); }
+    });
+    text(`${ab} of 3 brokers, min.insync.replicas 2`, r.x + 14, r.y + 40, 11.5, ab < 2 ? C.bad : C.muted);
+    S.live.cfg.topics.forEach(t => {
+      const tr = LAY["ktopic:" + t.name], tp = S.kafka.topics[t.name];
+      const ok = kOK(t.acks);
+      ctx.fillStyle = C["surface-2"]; rr(tr.x, tr.y, tr.w, tr.h, 5); ctx.fill();
+      text(fit(t.name, 92, 12.5, 600), tr.x + 8, tr.y + 17, 12.5, ok ? C.ink : C.bad, 600);
+      text(`acks ${t.acks}, ${t.retention}d${t.processing ? ", proc" : ""}`, tr.x + 100, tr.y + 17, 11, C.muted);
+      text(tp ? fmt(tp.msgs.length) : "0", tr.x + tr.w - 8, tr.y + 17, 12, C.ink, 500, "right");
+    });
+  }
+  /* retry topics */
+  {
+    const r = box("retry", C.retry, "Retry topics", { sel: isSel("retry") });
+    text("partition per destination, steps 1 / 2 / 3", r.x + 14, r.y + 36, 11, C.muted);
+    S.dests.forEach(d => {
+      const tr = LAY["retry:" + d.id], q = S.retry[d.id];
+      const n = q ? q.steps.map(s => s.length) : [0, 0, 0];
+      text(fit(d.name, 96, 12), tr.x + 6, tr.y + 14, 12, C.ink);
+      let rx = tr.x + tr.w - 6;
+      text(`${n[0]} / ${n[1]} / ${n[2]}`, rx, tr.y + 14, 12, n[0] + n[1] + n[2] ? C.retry : C.muted, 500, "right");
+      if (q && q.paused) pill("all paused", tr.x + 170 - 16, tr.y + 13, C.bad);
+      else if (q && q.controls.some(c => c.ramp)) pill("ramping", tr.x + 170 - 16, tr.y + 13, C.retry);
+    });
+  }
+  /* dlq + s3 */
+  {
+    const r = box("dlq", C.bad, "DLQ", { sel: isSel("dlq") });
+    text(fmt(S.dlq.items.length), r.x + 14, r.y + 46, 20, S.dlq.items.length ? C.bad : C.ink, 600);
+    text("alerts on-call", r.x + r.w - 10, r.y + 46, 11, C.muted, 400, "right");
+    const s = box("s3", C.muted, "S3", { sel: isSel("dlq") });
+    text(fmt(S.dlq.archived), s.x + 14, s.y + 46, 16, C.ink, 600);
+  }
+  /* consumer groups */
+  S.groups.forEach(g => {
+    const alive = aliveCount(g.pods);
+    const r = box("group:" + g.id, C.cons, g.name, { sel: isSel("group", g.id), down: alive === 0 });
+    const ds = S.dests.filter(d => d.groupId === g.id);
+    const sub = g.type === "dedicated" ? `dedicated to ${ds[0] ? ds[0].name : "nothing yet"}` : `shared, ${ds.length} destination${ds.length === 1 ? "" : "s"}`;
+    text(fit(sub, r.w - 28, 11.5), r.x + 14, r.y + 37, 11.5, C.muted);
+    podRow(g.pods, r.x + 14, r.y + 46, C.cons);
+    let lag = 0; g.topics.forEach(t => { const tp = S.kafka.topics[t]; if (tp && g.offsets[t] != null) lag += endOff(tp) - g.offsets[t]; });
+    if (g.stalled) pill("stalled", r.x + r.w - 10, r.y + 59, C.retry);
+    else text(`lag ${fmt(lag)}`, r.x + r.w - 10, r.y + 59, 11.5, lag > 100 ? C.bad : C.muted, 500, "right");
+  });
+  /* retry consumer */
+  {
+    const r = box("rc", C.retry, "Retry consumer", { sel: isSel("rc") });
+    let paused = 0, waiting = 0;
+    S.dests.forEach(d => { const q = S.retry[d.id]; if (q) { paused += q.paused ? 3 : 0; waiting += retryWaiting(q); } });
+    text(`${fmt(waiting)} waiting, ${paused} steps paused`, r.x + 14, r.y + 39, 11, paused ? C.bad : C.muted);
+    text("sends straight to destinations", r.x + 14, r.y + 54, 11, C.muted);
+  }
+  /* destinations */
+  const ST = { up: ["healthy", "ok"], slow: ["slow, 4x cost", "retry"], flaky: ["flaky, 40% 503s", "retry"], down: ["down, 503s", "bad"], reject: ["rejecting, 400s", "bad"] };
+  S.dests.forEach(d => {
+    const r = box("dest:" + d.id, C.dest, d.name, { sel: isSel("dest", d.id), down: d.status === "down" });
+    const [lbl, col] = ST[d.status];
+    text(d.groupId ? lbl : "not served by any consumer", r.x + 14, r.y + 39, 12, d.groupId ? C[col] : C.bad);
+    text(`${fmt(d.delivered)} delivered`, r.x + 14, r.y + 57, 11.5, C.muted);
+    const b = d.br.state;
+    pill(b === "closed" ? "breaker closed" : b === "open" ? "breaker open" : "half-open", r.x + r.w - 10, r.y + 56, b === "closed" ? C.ok : b === "open" ? C.bad : C.retry);
+  });
+
+  drawDots(now);
+}
+
+/* ---------- canvas input ---------- */
+function hitAt(e) {
+  const rect = cv.getBoundingClientRect();
+  const x = (e.clientX - rect.left) / scale, y = (e.clientY - rect.top) / scale;
+  for (let i = HITS.length - 1; i >= 0; i--) { const h = HITS[i], r = h.r; if (x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h) return h; }
+  return null;
+}
+cv.addEventListener("click", e => { const h = hitAt(e); if (h) select(h.kind, h.id); else { S.sel = null; S.mode = null; panelDirty = true; } });
+cv.addEventListener("mousemove", e => { cv.style.cursor = hitAt(e) ? "pointer" : "default"; });
+
+/* ---------- panel ---------- */
+let LIVE = [];
+const lv = fn => { LIVE.push(fn); return `<span data-lv="${LIVE.length - 1}"></span>`; };
+function updateLive() {
+  root.querySelectorAll("#inspector [data-lv]").forEach(el => {
+    const fn = LIVE[+el.dataset.lv]; if (!fn) return;
+    const v = String(fn()); if (el.textContent !== v) el.textContent = v;
+  });
+}
+const opt = (v, label, sel) => `<option value="${esc(v)}"${sel ? " selected" : ""}>${esc(label)}</option>`;
+const podList = (pods, kind, gid = "") => `<ul class="pods">${pods.map((p, i) => `<li>Pod ${i + 1}<span class="st ${p.alive ? "alive" : "dead"}">${p.alive ? "running" : "dead"}</span>${p.alive
+  ? `<button class="btn sm danger" data-act="kill-${kind}" data-id="${p.id}" data-g="${gid}">Kill</button>`
+  : `<button class="btn sm" data-act="revive-${kind}" data-id="${p.id}" data-g="${gid}">Restart</button>`}</li>`).join("")}</ul>`;
+
+function renderPanel() {
+  LIVE = [];
+  const el = $("#inspector");
+  let h;
+  if (S.mode === "addGen") h = formGen();
+  else if (S.mode === "addGroup") h = formGroup();
+  else if (S.mode === "addDest") h = formDest();
+  else if (!S.sel) h = pOverview();
+  else {
+    const { kind, id } = S.sel;
+    h = ({ cp: pCp, gen: () => pGen(id), prod: pProd, outbox: pOutbox, fallback: pFallback, kafka: pKafka, retry: pRetry, dlq: pDlq, group: () => pGroup(id), rc: pRc, dest: () => pDest(id) }[kind] || pOverview)();
+  }
+  el.innerHTML = h;
+  updateLive();
+  panelDirty = false;
+}
+
+function pOverview() {
+  const comps = [["cp", null, "Control plane"], ["prod", null, "Producer service"], ["outbox", null, "Outbox"], ["kafka", null, "Kafka"], ["retry", null, "Retry topics"], ["dlq", null, "DLQ"], ["rc", null, "Retry consumer"]]
+    .concat(S.gens.map(g => ["gen", g.id, g.name]), S.groups.map(g => ["group", g.id, g.name]), S.dests.map(d => ["dest", d.id, d.name]));
+  return `<h2>System overview</h2><p class="role">Nothing selected</p>
+  <p>Messages flow left to right: generators send logs to the producer service, which writes them to Kafka (or the outbox when they need processing). Consumers read from Kafka and deliver to destinations.</p>
+  <p class="note">Try "Break something…" in the toolbar, then watch the retry topics, breakers and DLQ react. "Heal everything" brings it back.</p>
+  <h3>Jump to a component</h3>
+  <div class="complist">${comps.map(([k, i, n]) => `<button class="btn sm" data-act="sel" data-kind="${k}" data-id="${i ?? ""}">${esc(n)}</button>`).join("")}</div>`;
+}
+
+function pGen(id) {
+  const g = S.gens.find(x => x.id === id); if (!g) return pOverview();
+  const topics = S.live.cfg.topics;
+  return `<h2>${esc(g.name)}</h2><p class="role">Message generator, stands in for an app sending WAL logs</p>
+  <label for="gtopic">Topic</label>
+  <select id="gtopic" data-act="gen-topic" data-id="${g.id}">${topics.map(t => opt(t.name, t.name, t.name === g.topic)).join("")}${topics.some(t => t.name === g.topic) ? "" : opt(g.topic, g.topic + " (deleted)", true)}</select>
+  <label for="grate">Rate: <span id="grate-v">${g.rate}</span> msg/s</label>
+  <input id="grate" type="range" min="0" max="80" step="1" value="${g.rate}" data-act="gen-rate" data-id="${g.id}">
+  <label class="check"><input type="checkbox" data-act="gen-on" data-id="${g.id}"${g.on ? " checked" : ""}> Sending</label>
+  <dl class="kv"><dt>Accepted</dt><dd>${lv(() => fmt(g.sent))}</dd><dt>Rejected</dt><dd>${lv(() => fmt(g.rej))}</dd></dl>
+  <button class="btn danger" data-act="del-gen" data-id="${g.id}">Delete generator</button>`;
+}
+
+function pProd() {
+  return `<h2>Producer service</h2><p class="role">Single entry point, behind a load balancer</p>
+  <p>Acks the caller only after Kafka acks with the topic's acks setting, or after the outbox row commits for topics that need processing. If Kafka can't ack, it writes to the fallback buffer.</p>
+  <dl class="kv"><dt>Capacity</dt><dd>${lv(() => fmt(aliveCount(S.prod.pods) * PROD_CAP) + " msg/s")}</dd>
+  <dt>Accepted now</dt><dd>${lv(() => S.rates.in.toFixed(1) + " msg/s")}</dd><dt>Rejected total</dt><dd>${lv(() => fmt(S.stats.rejected))}</dd></dl>
+  <label class="check"><input type="checkbox" data-act="watchdog"${S.prod.watchdog ? " checked" : ""}> Watchdog replaces dead pods after ${WATCHDOG}s</label>
+  <h3>Pods</h3>${podList(S.prod.pods, "prod")}
+  <div class="row"><button class="btn sm" data-act="add-prod-pod">Spin up pod</button><button class="btn sm" data-act="rm-prod-pod"${S.prod.pods.length <= 1 ? " disabled" : ""}>Remove last pod</button></div>`;
+}
+
+function pOutbox() {
+  const ob = S.outbox;
+  const cnt = st => () => fmt(ob.rows.filter(r => r.state === st).length);
+  return `<h2>Outbox</h2><p class="role">Postgres + pg-boss, for logs that need processing</p>
+  <p class="note">Rows move pending → processing → processed → stored. A row stuck in processing past ${PROC_TIMEOUT}s is retried. After ${MAX_ATTEMPTS} attempts it goes to the outbox DLQ.</p>
+  <dl class="kv"><dt>Pending</dt><dd>${lv(cnt("pending"))}</dd><dt>Processing</dt><dd>${lv(cnt("processing"))}</dd><dt>Processed, waiting for Kafka</dt><dd>${lv(cnt("processed"))}</dd>
+  <dt>Stored in Kafka</dt><dd>${lv(() => fmt(ob.stored))}</dd><dt>Outbox DLQ</dt><dd>${lv(() => fmt(ob.dlq))}</dd></dl>
+  <label>Processor workers</label>
+  <div class="row"><button class="btn sm" data-act="workers" data-d="-1"${ob.workers <= 0 ? " disabled" : ""}>−</button><b>${ob.workers}</b><button class="btn sm" data-act="workers" data-d="1">+</button></div>
+  <h3>Failures</h3>
+  <div class="row"><button class="btn sm${ob.crashed ? "" : " danger"}" data-act="crash">${ob.crashed ? "Fix processor" : "Crash processor"}</button>
+  <button class="btn sm${S.pg.up ? " danger" : ""}" data-act="pg">${S.pg.up ? "Take Postgres down" : "Bring Postgres up"}</button></div>`;
+}
+
+function pFallback() {
+  return `<h2>Fallback buffer</h2><p class="role">Postgres, used when Kafka can't ack</p>
+  <p>When a topic's acks requirement can't be met (for example only 1 broker alive and the topic uses acks=all), the producer stores the log here instead of timing out. It drains into Kafka once Kafka is back.</p>
+  <dl class="kv"><dt>Waiting</dt><dd>${lv(() => fmt(S.fallback.q.length))}</dd><dt>Postgres</dt><dd>${lv(() => S.pg.up ? "up" : "down")}</dd></dl>
+  <p class="note">No size cap is set, so a long Kafka outage keeps growing this.</p>`;
+}
+
+function pKafka() {
+  return `<h2>Kafka</h2><p class="role">3 brokers, KRaft, min.insync.replicas 2</p>
+  <p class="note">acks=all topics need 2 brokers alive. acks=1 topics need 1. Consumers can read with 1 broker, but writing to retry topics and the DLQ needs 2.</p>
+  <h3>Brokers</h3>
+  <ul class="pods">${S.kafka.brokers.map((on, i) => `<li>Broker ${i + 1}<span class="st ${on ? "alive" : "dead"}">${on ? "running" : "down"}</span><button class="btn sm${on ? " danger" : ""}" data-act="broker" data-i="${i}">${on ? "Kill" : "Restart"}</button></li>`).join("")}</ul>
+  <div class="row"><button class="btn sm danger" data-act="kafka-out">Kill all brokers</button><button class="btn sm" data-act="kafka-up">Restart all</button></div>
+  <h3>Topics</h3>
+  <div class="tscroll"><table class="t"><thead><tr><th>Topic</th><th>Acks</th><th>Retention</th><th class="n">Retained</th></tr></thead><tbody>
+  ${S.live.cfg.topics.map(t => `<tr><td>${esc(t.name)}</td><td>${t.acks}</td><td>${t.retention} days</td><td class="n">${lv(() => fmt((S.kafka.topics[t.name] || { msgs: [] }).msgs.length))}</td></tr>`).join("")}
+  </tbody></table></div>
+  <p class="note">Topics, acks and retention are edited in the control plane.</p>`;
+}
+
+function pRetry() {
+  return `<h2>Retry topics</h2><p class="role">One partition per destination, 3 steps with backoff + jitter</p>
+  <p class="note">Step 1: 10s; step 2: 1 min; step 3: 5 min, each measured from entry into that step (±30% jitter). Demo waits: ${RETRY_DELAY.join("s, ")}s. All new failed or breaker-routed messages enter step 1, even while its consumption is paused. Retry and DLQ retention is compressed separately to 14 × ${DAY}s.</p>
+  <div class="tscroll"><table class="t"><thead><tr><th>Destination</th><th>Step</th><th class="n">Waiting</th><th>State</th><th class="n">Failures</th></tr></thead><tbody>
+  ${S.dests.map(d => { const r = S.retry[d.id]; return [0, 1, 2].map(s => `<tr><td>${esc(d.name)}</td><td>${s + 1}</td><td class="n">${lv(() => fmt(r.steps[s].length))}</td><td>${lv(() => retryStepState(r, s))}</td><td class="n">${lv(() => r.controls[s].consec + "/" + TRIP)}</td></tr>`).join(""); }).join("")}
+  </tbody></table></div>`;
+}
+
+function pRc() {
+  return `<h2>Retry consumer</h2><p class="role">Reads retry topics and sends straight to destinations</p>
+  <p class="note">After ${TRIP} consecutive transient failures at any step, all three retry steps for that destination pause together. The last failed message is handed off before pausing, then all queued messages stay put and new messages accumulate in step 1. One coordinated probe uses a due real message every ${PROBE}s (2 minutes outside the demo); separate main-consumer probes are suppressed during the pause. A transient probe failure keeps all steps paused; a successful probe resumes all steps at 2 msg/s each and doubles gradually. Permanent responses go directly to the DLQ.</p>
+  <div class="tscroll"><table class="t"><thead><tr><th>Destination</th><th>Step</th><th class="n">Waiting</th><th class="n">Failures</th><th>State</th><th class="n">Probe in</th></tr></thead><tbody>
+  ${S.dests.map(d => { const r = S.retry[d.id]; return [0, 1, 2].map(s => `<tr><td>${esc(d.name)}</td><td>${s + 1}</td><td class="n">${lv(() => fmt(r.steps[s].length))}</td><td class="n">${lv(() => r.controls[s].consec + "/" + TRIP)}</td><td>${lv(() => retryStepState(r, s))}</td><td class="n">${lv(() => r.paused ? Math.max(0, r.probeAt - S.t).toFixed(0) + "s (shared)" : "")}</td></tr>`).join(""); }).join("")}
+  </tbody></table></div>`;
+}
+
+function pDlq() {
+  const byDest = () => { const m = {}; S.dlq.items.forEach(it => m[it.dest] = (m[it.dest] || 0) + 1); return m; };
+  return `<h2>DLQ</h2><p class="role">Kafka topic, 14 day retention, alerts on-call</p>
+  <p class="note">Each DLQ write raises a telemetry alert. A daily worker archives DLQ logs older than 10 days to S3.</p>
+  <dl class="kv"><dt>In DLQ now</dt><dd>${lv(() => fmt(S.dlq.items.length))}</dd><dt>Archived to S3</dt><dd>${lv(() => fmt(S.dlq.archived))}</dd><dt>Outbox DLQ (Postgres)</dt><dd>${lv(() => fmt(S.outbox.dlq))}</dd></dl>
+  <h3>By destination</h3>
+  <dl class="kv">${S.dests.map(d => `<dt>${esc(d.name)}</dt><dd>${lv(() => fmt(byDest()[d.id] || 0))}</dd>`).join("")}</dl>
+  <p class="note">On-call fixes the cause first, then redrives.</p>
+  <button class="btn" data-act="redrive">Redrive DLQ to retry step 1</button>`;
+}
+
+function pGroup(id) {
+  const g = groupById(id); if (!g) return pOverview();
+  const mine = S.dests.filter(d => d.groupId === g.id);
+  const destPicker = g.type === "dedicated"
+    ? `<label for="gdest">Dedicated to</label><select id="gdest" data-act="group-dedicate" data-id="${g.id}">${opt("", "Pick a destination", !mine.length)}${S.dests.map(d => opt(d.id, d.name, mine[0] && mine[0].id === d.id)).join("")}</select>`
+    : `<label>Destinations served</label>${S.dests.map(d => `<label class="check"><input type="checkbox" data-act="group-serve" data-id="${g.id}" data-d="${d.id}"${d.groupId === g.id ? " checked" : ""}> ${esc(d.name)}${d.groupId && d.groupId !== g.id ? ` <span class="note">(now on ${esc(groupById(d.groupId)?.name || "?")})</span>` : ""}</label>`).join("")}`;
+  return `<h2>${esc(g.name)}</h2><p class="role">${g.type === "dedicated" ? "Service specific consumer" : "Shared consumer"} group, ${CONS_CAP} deliveries/s per pod</p>
+  <label for="gtype">Type</label>
+  <select id="gtype" data-act="group-type" data-id="${g.id}">${opt("shared", "Shared", g.type === "shared")}${opt("dedicated", "Service specific (dedicated)", g.type === "dedicated")}</select>
+  ${destPicker}
+  <h3>Lag by topic</h3>
+  <dl class="kv">${g.topics.length ? g.topics.map(t => `<dt>${esc(t)}</dt><dd>${lv(() => { const tp = S.kafka.topics[t]; return tp && g.offsets[t] != null ? fmt(endOff(tp) - g.offsets[t]) : "0"; })}</dd>`).join("") : "<dt>No subscribed topics</dt><dd></dd>"}
+  <dt>Lost to retention</dt><dd>${lv(() => fmt(g.lost))}</dd><dt>State</dt><dd>${lv(() => !aliveCount(g.pods) ? "no pods" : g.stalled ? "stalled" : "consuming")}</dd></dl>
+  <h3>Pods</h3>${podList(g.pods, "cons", g.id)}
+  <div class="row"><button class="btn sm" data-act="add-cons-pod" data-id="${g.id}">Spin up pod</button><button class="btn sm" data-act="rm-cons-pod" data-id="${g.id}"${g.pods.length <= 1 ? " disabled" : ""}>Remove last pod</button></div>
+  <h3>Remove</h3><button class="btn danger" data-act="del-group" data-id="${g.id}">Delete consumer</button>`;
+}
+
+function pDest(id) {
+  const d = destById(id); if (!d) return pOverview();
+  const r = S.retry[d.id];
+  const st = [["up", "Healthy"], ["slow", "Slow (each delivery costs 4x)"], ["flaky", "Flaky (40% transient 503s)"], ["down", "Down (transient 503s)"], ["reject", "Rejecting (permanent 400s)"]];
+  const subs = Object.entries(S.live.cfg.routing).filter(([, ds]) => ds.includes(d.id)).map(([t]) => t);
+  return `<h2>${esc(d.name)}</h2><p class="role">Destination service</p>
+  <label>Behaviour</label>
+  <div class="statusgrid">${st.map(([v, l]) => `<label><input type="radio" name="dst" data-act="dest-status" data-id="${d.id}" value="${v}"${d.status === v ? " checked" : ""}> ${l}</label>`).join("")}</div>
+  <label for="dgroup">Served by</label>
+  <select id="dgroup" data-act="dest-group" data-id="${d.id}">${opt("", "No consumer", !d.groupId)}${S.groups.map(g => opt(g.id, `${g.name} (${g.type})`, d.groupId === g.id)).join("")}</select>
+  <p class="note">Subscribed topics: ${subs.length ? subs.map(esc).join(", ") : "none"}. Change routing in the control plane.</p>
+  <dl class="kv"><dt>Delivered</dt><dd>${lv(() => fmt(d.delivered))}</dd><dt>Deduped by consumer</dt><dd>${lv(() => fmt(d.deduped))}</dd>
+  <dt>Main breaker</dt><dd>${lv(() => d.br.state === "half" ? "half-open" : d.br.state + (d.br.state === "closed" && d.br.consec ? ` (${d.br.consec} fails in a row)` : ""))}</dd>
+  <dt>Waiting in retry</dt><dd>${lv(() => fmt(retryWaiting(r)))}</dd><dt>Retry steps</dt><dd>${lv(() => retrySummary(r))}</dd>
+  <dt>Sent to DLQ</dt><dd>${lv(() => fmt(d.dlq))}</dd></dl>
+  <button class="btn danger" data-act="del-dest" data-id="${d.id}">Delete destination</button>`;
+}
+
+function pCp() {
+  const cfg = S.cp.cfg, dis = S.cp.up ? "" : " disabled";
+  return `<h2>Control plane</h2><p class="role">Topics, acks, retention and routing</p>
+  <div class="row"><button class="btn sm${S.cp.up ? " danger" : ""}" data-act="cp-toggle">${S.cp.up ? "Take control plane down" : "Bring control plane up"}</button></div>
+  <dl class="kv"><dt>Saved config</dt><dd>${lv(() => "v" + S.cp.version)}</dd><dt>Live on nodes</dt><dd>${lv(() => "v" + S.live.version)}</dd>
+  <dt>Status</dt><dd>${lv(() => !S.cp.up ? "down" : S.cp.pending ? (aliveBrokers() ? "reconciling with Kafka" : "waiting for Kafka") : "in sync")}</dd></dl>
+  ${S.cp.up ? `<p class="note">Changes save as a new version, reconcile with Kafka, then push to producers and consumers.</p>` : `<div class="callout">The control plane is down. Producers and consumers keep running on their cached config v${S.live.version}. Bring it up to edit.</div>`}
+  <h3>Topics</h3>
+  <div class="tscroll"><table class="t"><thead><tr><th>Name</th><th>Acks</th><th>Days</th><th>Processing</th><th></th></tr></thead><tbody>
+  ${cfg.topics.map((t, i) => `<tr><td>${esc(t.name)}</td>
+    <td><select data-act="cp-acks" data-i="${i}"${dis}>${opt("all", "all (-1)", t.acks === "all")}${opt("1", "1", t.acks === "1")}</select></td>
+    <td><input type="number" min="1" max="30" value="${t.retention}" data-act="cp-ret" data-i="${i}"${dis}></td>
+    <td><input type="checkbox" aria-label="needs processing" data-act="cp-proc" data-i="${i}"${t.processing ? " checked" : ""}${dis}></td>
+    <td><button class="btn sm danger" data-act="cp-del" data-i="${i}"${dis} aria-label="Delete topic ${esc(t.name)}">Delete</button></td></tr>`).join("")}
+  </tbody></table></div>
+  <div class="row" style="margin-top:8px"><input type="text" id="newTopic" placeholder="new-topic-name" style="flex:1;min-width:0;width:auto"${dis}><button class="btn sm" data-act="cp-add"${dis}>Add topic</button></div>
+  <h3>Routing (topic → destinations)</h3>
+  <div class="tscroll"><table class="t"><thead><tr><th>Topic</th>${S.dests.map(d => `<th>${esc(d.name)}</th>`).join("")}</tr></thead><tbody>
+  ${cfg.topics.map(t => `<tr><td>${esc(t.name)}</td>${S.dests.map(d => `<td><input type="checkbox" aria-label="${esc(t.name)} to ${esc(d.name)}" data-act="cp-route" data-t="${esc(t.name)}" data-d="${d.id}"${(cfg.routing[t.name] || []).includes(d.id) ? " checked" : ""}${dis}></td>`).join("")}</tr>`).join("")}
+  </tbody></table></div>`;
+}
+
+function formGen() {
+  return `<h2>Add generator</h2><p class="role">A source that sends logs to the producer service</p>
+  <label for="fgName">Name</label><input type="text" id="fgName" value="new-app-${S.gens.length + 1}">
+  <label for="fgTopic">Topic</label><select id="fgTopic">${S.live.cfg.topics.map(t => opt(t.name, t.name)).join("")}</select>
+  <label for="fgRate">Rate (msg/s)</label><input type="number" id="fgRate" min="1" max="80" value="5">
+  <div class="row" style="margin-top:12px"><button class="btn primary" data-act="create-gen">Create generator</button><button class="btn" data-act="cancel">Cancel</button></div>`;
+}
+function formGroup() {
+  return `<h2>Add consumer</h2><p class="role">A new consumer group</p>
+  <label for="fcName">Name</label><input type="text" id="fcName" value="consumer-${S.groups.length + 1}">
+  <label for="fcType">Type</label><select id="fcType">${opt("shared", "Shared")}${opt("dedicated", "Service specific (dedicated)")}</select>
+  <label for="fcDest">Destination to take over</label>
+  <select id="fcDest">${opt("", "None for now")}${S.dests.map(d => opt(d.id, d.name)).join("")}</select>
+  <p class="note">A dedicated consumer serves exactly one destination. A shared one can take more from its own panel later.</p>
+  <label for="fcPods">Pods</label><input type="number" id="fcPods" min="1" max="14" value="2">
+  <div class="row" style="margin-top:12px"><button class="btn primary" data-act="create-group">Create consumer</button><button class="btn" data-act="cancel">Cancel</button></div>`;
+}
+function formDest() {
+  const dis = S.cp.up ? "" : " disabled";
+  return `<h2>Add destination</h2><p class="role">A 1st or 3rd party service that receives logs</p>
+  <label for="fdName">Name</label><input type="text" id="fdName" value="service-${S.dests.length + 1}">
+  <label for="fdGroup">Served by</label><select id="fdGroup">${S.groups.map(g => opt(g.id, `${g.name} (${g.type})`, g.type === "shared")).join("")}${opt("", "No consumer yet")}</select>
+  <label>Subscribe to topics</label>
+  ${S.cp.cfg.topics.map(t => `<label class="check"><input type="checkbox" class="fdTopic" value="${esc(t.name)}"${dis}> ${esc(t.name)}</label>`).join("")}
+  ${S.cp.up ? "" : `<p class="note">The control plane is down, so routing can't change. The destination will be created without topics.</p>`}
+  <div class="row" style="margin-top:12px"><button class="btn primary" data-act="create-dest">Create destination</button><button class="btn" data-act="cancel">Cancel</button></div>`;
+}
+
+/* ---------- panel events ---------- */
+const slug = s => s.trim().toLowerCase().replace(/[^a-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 32);
+function freeDest(d) {
+  const oldG = d.groupId ? groupById(d.groupId) : null;
+  return oldG;
+}
+function moveDest(d, gid) {
+  if (gid) {
+    const g = groupById(gid);
+    if (g && g.type === "dedicated") S.dests.forEach(o => { if (o.groupId === gid && o.id !== d.id) o.groupId = fallbackGroup(gid); });
+  }
+  d.groupId = gid || null;
+  log(`${d.name} is now served by ${gid ? groupById(gid).name : "no consumer"}`, "info");
+}
+function fallbackGroup(exclude) { const g = S.groups.find(x => x.type === "shared" && x.id !== exclude); return g ? g.id : null; }
+
+function onAct(el, e) {
+  const a = el.dataset.act, id = el.dataset.id;
+  const g = id ? groupById(id) : null;
+  switch (a) {
+    case "sel": select(el.dataset.kind, el.dataset.id || undefined); return;
+    case "cancel": S.mode = null; break;
+    case "gen-topic": { const x = S.gens.find(q => q.id === id); x.topic = el.value; break; }
+    case "gen-rate": { const x = S.gens.find(q => q.id === id); x.rate = +el.value; const v = $("#grate-v"); if (v) v.textContent = el.value; return; }
+    case "gen-on": { const x = S.gens.find(q => q.id === id); x.on = el.checked; break; }
+    case "del-gen": S.gens = S.gens.filter(q => q.id !== id); S.sel = null; log("Generator removed"); break;
+    case "watchdog": S.prod.watchdog = el.checked; break;
+    case "kill-prod": { const p = S.prod.pods.find(q => q.id === id); if (p) killProdPod(p); break; }
+    case "revive-prod": { const p = S.prod.pods.find(q => q.id === id); if (p) { p.alive = true; log("Producer pod restarted", "ok"); } break; }
+    case "add-prod-pod": S.prod.pods.push(pod()); log(`Producer pod spun up, ${S.prod.pods.length} pods`, "ok"); break;
+    case "rm-prod-pod": if (S.prod.pods.length > 1) { S.prod.pods.pop(); log("Producer pod removed"); } break;
+    case "workers": S.outbox.workers = Math.max(0, S.outbox.workers + +el.dataset.d); break;
+    case "crash": S.outbox.crashed = !S.outbox.crashed; log(S.outbox.crashed ? "Outbox processor is crashing mid-processing" : "Outbox processor fixed", S.outbox.crashed ? "bad" : "ok"); break;
+    case "pg": S.pg.up = !S.pg.up; log(S.pg.up ? "Postgres back up" : "Postgres is down, outbox and fallback buffer unavailable", S.pg.up ? "ok" : "bad"); break;
+    case "broker": setBroker(+el.dataset.i, !S.kafka.brokers[+el.dataset.i]); break;
+    case "kafka-out": S.kafka.brokers = [false, false, false]; log("Kafka outage, all brokers down", "bad"); break;
+    case "kafka-up": S.kafka.brokers = [true, true, true]; log("All Kafka brokers back up", "ok"); break;
+    case "redrive": {
+      const n = S.dlq.items.length; let moved = 0;
+      S.dlq.items.forEach(it => { const d = destById(it.dest); if (d) { toRetry(d, it.msg, 0); moved++; } });
+      S.dlq.items = []; log(`On-call redrove ${moved} of ${n} DLQ messages to retry step 1`, "ok"); break;
+    }
+    case "kill-cons": { const gg = groupById(el.dataset.g), p = gg && gg.pods.find(q => q.id === id); if (p) killConsPod(gg, p); break; }
+    case "revive-cons": { const gg = groupById(el.dataset.g), p = gg && gg.pods.find(q => q.id === id); if (p) { p.alive = true; log(`${gg.name}: pod restarted`, "ok"); } break; }
+    case "add-cons-pod": g.pods.push(pod()); log(`${g.name}: pod spun up, ${g.pods.length} pods`, "ok"); break;
+    case "rm-cons-pod": if (g.pods.length > 1) { g.pods.pop(); log(`${g.name}: pod removed`); } break;
+    case "group-type": {
+      g.type = el.value;
+      if (g.type === "dedicated") { const mine = S.dests.filter(d => d.groupId === g.id); mine.slice(1).forEach(d => d.groupId = fallbackGroup(g.id)); }
+      log(`${g.name} is now ${g.type}`); break;
+    }
+    case "group-dedicate": {
+      S.dests.forEach(d => { if (d.groupId === g.id) d.groupId = fallbackGroup(g.id); });
+      const d = destById(el.value); if (d) moveDest(d, g.id); break;
+    }
+    case "group-serve": { const d = destById(el.dataset.d); if (d) moveDest(d, el.checked ? g.id : null); break; }
+    case "del-group": {
+      const fb = fallbackGroup(g.id);
+      S.dests.forEach(d => { if (d.groupId === g.id) d.groupId = fb; });
+      S.groups = S.groups.filter(x => x.id !== g.id); S.sel = null;
+      log(`${g.name} deleted${fb ? `, its destinations moved to ${groupById(fb).name}` : ""}`, "info"); break;
+    }
+    case "dest-status": { const d = destById(id); if (d) setDest(d, el.value); break; }
+    case "dest-group": { const d = destById(id); if (d) moveDest(d, el.value || null); break; }
+    case "del-dest": {
+      const d = destById(id); if (!d) break;
+      S.dests = S.dests.filter(x => x.id !== id); delete S.retry[id];
+      for (const c of [S.cp.cfg, S.live.cfg]) for (const t in c.routing) c.routing[t] = c.routing[t].filter(x => x !== id);
+      S.sel = null; log(`${d.name} deleted and removed from routing`); break;
+    }
+    case "cp-toggle": S.cp.up = !S.cp.up; log(S.cp.up ? "Control plane back up" : "Control plane is down, nodes keep running on cached config", S.cp.up ? "ok" : "bad"); break;
+    case "cp-acks": { const t = S.cp.cfg.topics[+el.dataset.i]; t.acks = el.value; markCfg(`${t.name} acks=${t.acks}`); break; }
+    case "cp-ret": { const t = S.cp.cfg.topics[+el.dataset.i]; const v = Math.max(1, Math.min(30, Math.round(+el.value || 1))); if (v !== t.retention) { t.retention = v; markCfg(`${t.name} retention ${v} days`); } break; }
+    case "cp-proc": { const t = S.cp.cfg.topics[+el.dataset.i]; t.processing = el.checked; markCfg(`${t.name} ${t.processing ? "needs" : "skips"} processing`); break; }
+    case "cp-del": { const t = S.cp.cfg.topics.splice(+el.dataset.i, 1)[0]; delete S.cp.cfg.routing[t.name]; markCfg(`deleted topic ${t.name}`); break; }
+    case "cp-add": {
+      const inp = $("#newTopic"), name = slug(inp ? inp.value : "");
+      if (!name) { inp && inp.focus(); return; }
+      if (S.cp.cfg.topics.some(t => t.name === name)) { log(`Topic ${name} already exists`, "warn"); return; }
+      S.cp.cfg.topics.push({ name, acks: "all", retention: 7, processing: false }); S.cp.cfg.routing[name] = [];
+      markCfg(`added topic ${name}`); break;
+    }
+    case "cp-route": {
+      const t = el.dataset.t, d = el.dataset.d, list = S.cp.cfg.routing[t] || (S.cp.cfg.routing[t] = []);
+      if (el.checked) { if (!list.includes(d)) list.push(d); } else S.cp.cfg.routing[t] = list.filter(x => x !== d);
+      markCfg(`${t} ${el.checked ? "now routes to" : "no longer routes to"} ${destById(d)?.name || d}`); break;
+    }
+    case "create-gen": {
+      const name = $("#fgName").value.trim() || "new-app", topic = $("#fgTopic").value, rate = Math.max(1, Math.min(80, +$("#fgRate").value || 5));
+      if (!topic) { log("Create a topic in the control plane first", "warn"); return; }
+      const x = mkGen(name, topic, rate); S.gens.push(x); log(`Generator ${name} sending ${rate} msg/s to ${topic}`, "ok"); select("gen", x.id); break;
+    }
+    case "create-group": {
+      const name = $("#fcName").value.trim() || "consumer", type = $("#fcType").value, did = $("#fcDest").value, pods = Math.max(1, Math.min(14, +$("#fcPods").value || 2));
+      const x = mkGroup(nid("g"), name, type, pods); S.groups.push(x);
+      log(`Consumer ${name} (${type}) created with ${pods} pods`, "ok");
+      const d = destById(did); if (d) moveDest(d, x.id);
+      select("group", x.id); break;
+    }
+    case "create-dest": {
+      const name = $("#fdName").value.trim() || "service", gid = $("#fdGroup").value || null;
+      const did = nid("dest");
+      const d = mkDest(did, name, null); S.dests.push(d); S.retry[did] = mkRetry();
+      if (gid) moveDest(d, gid);
+      const topics = [...root.querySelectorAll(".fdTopic:checked")].map(i => i.value);
+      if (topics.length && S.cp.up) { topics.forEach(t => (S.cp.cfg.routing[t] || (S.cp.cfg.routing[t] = [])).push(did)); markCfg(`${name} subscribed to ${topics.join(", ")}`); }
+      log(`Destination ${name} added`, "ok"); select("dest", did); break;
+    }
+    default: return;
+  }
+  panelDirty = true;
+}
+const insp = $("#inspector");
+insp.addEventListener("click", e => { const el = e.target.closest("button[data-act]"); if (el) onAct(el, e); });
+insp.addEventListener("change", e => { const el = e.target.closest("[data-act]"); if (el && el.tagName !== "BUTTON") onAct(el, e); });
+insp.addEventListener("input", e => { const el = e.target; if (el.dataset.act === "gen-rate") onAct(el, e); });
+
+/* toolbar */
+root.querySelectorAll("[data-open]").forEach(b => b.addEventListener("click", () => { S.mode = b.dataset.open; S.sel = null; panelDirty = true; }));
+$("#addProdPod").addEventListener("click", () => { S.prod.pods.push(pod()); log(`Producer pod spun up, ${S.prod.pods.length} pods`, "ok"); select("prod"); });
+$("#openCp").addEventListener("click", () => select("cp"));
+$("#scenario").addEventListener("change", e => { if (e.target.value) scenario(e.target.value); e.target.value = ""; });
+$("#healBtn").addEventListener("click", () => { heal(); panelDirty = true; });
+$("#resetBtn").addEventListener("click", () => { initState(); dots.length = 0; panelDirty = true; });
+const pauseBtn = $("#pauseBtn");
+pauseBtn.addEventListener("click", () => { S.paused = !S.paused; pauseBtn.textContent = S.paused ? "Resume" : "Pause"; });
+
+/* stats + log */
+function renderStats() {
+  let lag = 0; S.groups.forEach(g => g.topics.forEach(t => { const tp = S.kafka.topics[t]; if (tp && g.offsets[t] != null) lag += endOff(tp) - g.offsets[t]; }));
+  let retry = 0; S.dests.forEach(d => { const r = S.retry[d.id]; if (r) retry += retryWaiting(r); });
+  const items = [
+    ["Accepted / s", S.rates.in.toFixed(1), ""], ["Delivered / s", S.rates.out.toFixed(1), "ok"],
+    ["Consumer lag", fmt(lag), lag > 200 ? "bad" : ""], ["Waiting in retry", fmt(retry), retry ? "warn" : ""],
+    ["Fallback buffer", fmt(S.fallback.q.length), S.fallback.q.length ? "warn" : ""], ["DLQ", fmt(S.dlq.items.length + S.outbox.dlq), (S.dlq.items.length + S.outbox.dlq) ? "bad" : ""],
+    ["Rejected", fmt(S.stats.rejected), S.stats.rejected ? "bad" : ""], ["Lost to retention", fmt(S.stats.lost), S.stats.lost ? "bad" : ""],
+    ["Sim time", `day ${(S.t / DAY).toFixed(1)}`, ""]
+  ];
+  $("#stats").innerHTML = items.map(([l, v, c]) => `<div class="stat ${c}"><b>${v}</b><span>${l}</span></div>`).join("");
+}
+function renderLog() {
+  $("#log").innerHTML = S.log.map(l => `<li class="${l.kind}"><time>${clock(l.t)}</time><span>${esc(l.text)}</span></li>`).join("");
+  logDirty = false;
+}
+
+/* ---------- loop ---------- */
+readColors();
+Kit.onTheme(readColors);
+
+initState();
+let lastUi = 0;
+function frame(dt, now) {
+  if (!S.paused) { const n = Math.max(1, Math.ceil(dt / 0.025)); for (let i = 0; i < n; i++) step(dt / n); }
+  try { draw(now); } catch (err) { console.error(err); }
+  if (now - lastUi > 250) {
+    lastUi = now;
+    const typing = insp.contains(document.activeElement) && /INPUT|SELECT/.test(document.activeElement.tagName) && document.activeElement.type !== "checkbox" && document.activeElement.type !== "radio";
+    if (panelDirty && !typing) renderPanel(); else updateLive();
+    renderStats();
+    if (logDirty) renderLog();
+  }
+}
+renderPanel();
+Kit.ready.then(() => Kit.loop(frame));
